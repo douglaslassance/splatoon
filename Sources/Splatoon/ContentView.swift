@@ -42,14 +42,31 @@ struct ContentView: View {
 
             Divider()
 
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Detail: \(Int(model.decimation * 100))% of Gaussians")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Slider(value: $model.decimation, in: 0.1...1.0)
+            }
+            .disabled(isGenerating)
+
             Button {
-                // Phase 2: run Core ML inference to generate the splat.
+                model.generateSplat()
             } label: {
                 Label("Generate Splat", systemImage: "cube.transparent")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!model.hasImage)
+            .disabled(!model.hasImage || isGenerating)
+
+            if model.generatedSplat != nil {
+                Button {
+                    model.exportSplat()
+                } label: {
+                    Label("Export Splat…", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
 
             statusView
 
@@ -68,6 +85,11 @@ struct ContentView: View {
         }
     }
 
+    private var isGenerating: Bool {
+        if case .generating = model.stage { return true }
+        return false
+    }
+
     @ViewBuilder
     private var statusView: some View {
         switch model.stage {
@@ -76,10 +98,20 @@ struct ContentView: View {
         case .loadingImage:
             ProgressView("Loading image…")
         case .ready:
-            Label("Image ready", systemImage: "checkmark.circle")
-                .foregroundStyle(.green)
+            if let count = model.lastGaussianCount, model.generatedSplat != nil {
+                Label("Generated \(count.formatted()) Gaussians",
+                      systemImage: "checkmark.circle")
+                    .foregroundStyle(.green)
+                    .font(.callout)
+            } else {
+                Label("Image ready", systemImage: "checkmark.circle")
+                    .foregroundStyle(.green)
+            }
         case .generating(let message):
-            ProgressView(message)
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(message)
+            }
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.red)
