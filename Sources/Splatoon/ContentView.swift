@@ -123,7 +123,16 @@ struct ContentView: View {
 
     @ViewBuilder
     private var preview: some View {
-        if let image = model.displayImage {
+        if let splat = model.generatedSplat {
+            VStack(spacing: 0) {
+                SplatViewer(url: splat)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text("Drag to orbit · scroll or pinch to zoom")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(6)
+            }
+        } else if let image = model.displayImage {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
