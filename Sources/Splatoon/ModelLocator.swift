@@ -1,67 +1,55 @@
 import Foundation
 import AppKit
 
-/// Resolves the location of `sharp.mlpackage`.
+/// Resolves the location of `sharp.mlpackage` (~2.7 GB, lives outside the app).
 ///
-/// The model is ~2.7 GB and lives outside the app bundle. Because the app is
-/// sandboxed, we can't read arbitrary paths — so the first time the user needs
-/// it we prompt with an open panel and persist a security-scoped bookmark.
-/// Subsequent launches resolve the bookmark without prompting.
+/// Lookup order:
+///   1. `SPLATOON_MODEL` environment variable
+///   2. A path remembered from a previous pick (UserDefaults)
+///   3. `Models/sharp.mlpackage` relative to the current directory
+///   4. Prompt the user with an open panel (and remember the choice)
+///
+/// The app is not sandboxed, so plain file paths are sufficient — no
+/// security-scoped bookmarks required.
 @MainActor
 enum ModelLocator {
-    private static let bookmarkKey = "sharpModelBookmark"
+    private static let defaultsKey = "sharpModelPath"
 
-    /// A URL the caller can immediately load. May prompt the user. The returned
-    /// URL has already had security-scoped access started; call
-    /// `endAccess(_:)` when finished.
     static func resolveModelURL(prompt: Bool = true) -> URL? {
-        if let url = resolveBookmark() { return url }
+        if let url = rememberedURL() { return url }
         guard prompt else { return nil }
         return promptForModel()
     }
 
-    /// Whether a remembered model is available without prompting.
-    static var hasRememberedModel: Bool {
-        UserDefaults.standard.data(forKey: bookmarkKey) != nil
-    }
+    /// Whether a model can be found without prompting.
+    static var hasRememberedModel: Bool { rememberedURL() != nil }
 
-    static func endAccess(_ url: URL) {
-        url.stopAccessingSecurityScopedResource()
-    }
-
-    // MARK: - Bookmark persistence
-
-    private static func resolveBookmark() -> URL? {
-        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return nil }
-        var isStale = false
-        guard let url = try? URL(
-            resolvingBookmarkData: data,
-            options: .withSecurityScope,
-            relativeTo: nil,
-            bookmarkDataIsStale: &isStale
-        ) else {
-            UserDefaults.standard.removeObject(forKey: bookmarkKey)
-            return nil
-        }
-        guard url.startAccessingSecurityScopedResource() else { return nil }
-        if isStale { saveBookmark(for: url) }
-        return url
-    }
-
-    private static func saveBookmark(for url: URL) {
-        guard let data = try? url.bookmarkData(
-            options: .withSecurityScope,
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        ) else { return }
-        UserDefaults.standard.set(data, forKey: bookmarkKey)
-    }
+    /// No-op retained for call-site symmetry (was security-scoped access).
+    static func endAccess(_ url: URL) {}
 
     static func forgetModel() {
-        UserDefaults.standard.removeObject(forKey: bookmarkKey)
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
     }
 
-    // MARK: - Prompt
+    // MARK: - Resolution
+
+    private static func rememberedURL() -> URL? {
+        let fm = FileManager.default
+
+        if let envPath = ProcessInfo.processInfo.environment["SPLATOON_MODEL"],
+           fm.fileExists(atPath: envPath) {
+            return URL(fileURLWithPath: envPath)
+        }
+        if let savedPath = UserDefaults.standard.string(forKey: defaultsKey),
+           fm.fileExists(atPath: savedPath) {
+            return URL(fileURLWithPath: savedPath)
+        }
+        let cwdCandidate = URL(fileURLWithPath: "Models/sharp.mlpackage")
+        if fm.fileExists(atPath: cwdCandidate.path) {
+            return cwdCandidate.standardizedFileURL
+        }
+        return nil
+    }
 
     private static func promptForModel() -> URL? {
         let panel = NSOpenPanel()
@@ -71,11 +59,9 @@ enum ModelLocator {
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = []
 
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        guard url.startAccessingSecurityScopedResource() else { return nil }
-        saveBookmark(for: url)
+        UserDefaults.standard.set(url.path, forKey: defaultsKey)
         return url
     }
 }

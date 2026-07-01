@@ -7,10 +7,12 @@ build/
 *.xcuserstate
 xcuserdata/
 
-# XcodeGen generates the project and these plists; project.yml is the source of truth
+# XcodeGen generates the project and Info.plist; project.yml is the source of truth
 *.xcodeproj
-Sources/Splatoon/Info.plist
-Sources/Splatoon/Splatoon.entitlements
+Support/Info.plist
+
+# SwiftPM app bundle produced by scripts/build-app.sh
+Splatoon.app/
 
 # Swift Package Manager
 .swiftpm/
