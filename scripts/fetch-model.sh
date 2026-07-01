@@ -13,13 +13,13 @@ set -euo pipefail
 REPO="pearsonkyle/Sharp-coreml"
 DEST_DIR="$(cd "$(dirname "$0")/.." && pwd)/Models"
 
-if command -v huggingface-cli >/dev/null 2>&1; then
-  HF="huggingface-cli"
-elif command -v hf >/dev/null 2>&1; then
+if command -v hf >/dev/null 2>&1; then
   HF="hf"
+elif command -v huggingface-cli >/dev/null 2>&1; then
+  HF="huggingface-cli"
 else
-  echo "error: huggingface-cli not found. Install it with:" >&2
-  echo "         pip install huggingface-hub" >&2
+  echo "error: Hugging Face CLI not found. Install it with:" >&2
+  echo "         pip install -U huggingface-hub" >&2
   exit 1
 fi
 
