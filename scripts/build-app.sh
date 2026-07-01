@@ -76,6 +76,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.graphics-design</string>
+    <key>NSPhotoLibraryUsageDescription</key><string>Splatoon reads your photos so you can turn them into 3D Gaussian splats. Images are processed on your device.</string>
 </dict>
 </plist>
 PLIST
