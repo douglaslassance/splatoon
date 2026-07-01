@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Xcode / build artifacts
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+
+# XcodeGen generates the project and these plists; project.yml is the source of truth
+*.xcodeproj
+Sources/Splatoon/Info.plist
+Sources/Splatoon/Splatoon.entitlements
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# Core ML model (multi-GB, fetched via scripts/fetch-model.sh)
+Models/
+*.mlpackage/
+*.mlmodelc/
+
+# Generated splats / renders
+Outputs/

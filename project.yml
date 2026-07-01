@@ -1,0 +1,48 @@
+name: Splatoon
+options:
+  bundleIdPrefix: com.douglaslassance
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "15.0"
+
+packages:
+  MetalSplatter:
+    url: https://github.com/scier/MetalSplatter
+    exactVersion: 1.0.1
+
+targets:
+  Splatoon:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Splatoon
+    dependencies:
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
+      - package: MetalSplatter
+        product: PLYIO
+    info:
+      path: Sources/Splatoon/Info.plist
+      properties:
+        CFBundleDisplayName: Splatoon
+        LSMinimumSystemVersion: "15.0"
+        LSApplicationCategoryType: public.app-category.graphics-design
+        NSHighResolutionCapable: true
+        NSPhotoLibraryUsageDescription: "Splatoon reads photos you choose so it can generate a 3D Gaussian splat on your device. Images are processed locally and never uploaded."
+    entitlements:
+      path: Sources/Splatoon/Splatoon.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.personal-information.photos-library: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.douglaslassance.Splatoon
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
