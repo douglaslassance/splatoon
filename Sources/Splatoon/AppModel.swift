@@ -44,14 +44,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// An `NSImage` wrapper for SwiftUI display; the `CGImage` remains the
-    /// source of truth for downstream image processing.
-    var displayImage: NSImage? {
-        guard let inputImage else { return nil }
-        return NSImage(cgImage: inputImage,
-                       size: NSSize(width: inputImage.width, height: inputImage.height))
-    }
-
     var hasImage: Bool { inputImage != nil }
 
     // MARK: - Loading

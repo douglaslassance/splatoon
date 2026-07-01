@@ -121,9 +121,30 @@ struct ContentView: View {
 
     // MARK: - Preview
 
+    private var isBusy: Bool {
+        switch model.stage {
+        case .loadingImage, .generating: return true
+        default: return false
+        }
+    }
+
+    private var busyMessage: String {
+        switch model.stage {
+        case .loadingImage: return "Loading image…"
+        case .generating(let message): return message
+        default: return ""
+        }
+    }
+
     @ViewBuilder
     private var preview: some View {
-        if let splat = model.generatedSplat {
+        if isBusy {
+            VStack(spacing: 14) {
+                ProgressView().controlSize(.large)
+                Text(busyMessage).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let splat = model.generatedSplat {
             VStack(spacing: 0) {
                 SplatViewer(url: splat)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -132,13 +153,6 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .padding(6)
             }
-        } else if let image = model.displayImage {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .padding()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.black.opacity(0.03))
         } else {
             ContentUnavailableView(
                 "No image selected",
