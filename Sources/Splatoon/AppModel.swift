@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import PhotosUI
 import ImageIO
+import CoreImage
 import UniformTypeIdentifiers
 
 /// Owns the app's input image and pipeline state. Phase 1 covers image
@@ -83,13 +84,31 @@ final class AppModel: ObservableObject {
 
     private func setImage(from data: Data) throws {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+              let raw = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw LoadError.decodeFailed
         }
-        inputImage = image
+        inputImage = Self.orientationCorrected(raw, source: source)
         generatedSplat = nil
         lastGaussianCount = nil
         stage = .ready
+        // Picking an image immediately kicks off generation.
+        generateSplat()
+    }
+
+    /// Bakes the source's EXIF orientation into the pixels so portrait photos
+    /// (stored landscape + a rotation flag) are upright for both display and the
+    /// model. `CGImageSourceCreateImageAtIndex` ignores the orientation tag.
+    private nonisolated static func orientationCorrected(_ cgImage: CGImage,
+                                                         source: CGImageSource) -> CGImage {
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let rawOrientation = (properties?[kCGImagePropertyOrientation] as? UInt32) ?? 1
+        guard rawOrientation != 1,
+              let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+            return cgImage
+        }
+        let ciImage = CIImage(cgImage: cgImage).oriented(orientation)
+        let context = CIContext(options: nil)
+        return context.createCGImage(ciImage, from: ciImage.extent) ?? cgImage
     }
 
     // MARK: - Generation
