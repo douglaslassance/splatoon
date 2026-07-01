@@ -31,6 +31,10 @@ final class AppModel: ObservableObject {
     /// Fraction of Gaussians to keep (1.0 = all, 0.5 = most important 50%).
     var decimation: Float = 1.0
 
+    /// The loaded model, kept resident and reused across generations.
+    private var cachedRunner: SharpModelRunner?
+    private var cachedRunnerURL: URL?
+
     /// Bound to the `PhotosPicker`. Selecting an item kicks off a load.
     @Published var photoSelection: PhotosPickerItem? {
         didSet {
@@ -103,10 +107,19 @@ final class AppModel: ObservableObject {
         stage = .generating("Loading model…")
         let focal = focalLengthPx
         let decimation = self.decimation
+        // Reuse the loaded model across generations. This avoids reloading the
+        // ~2.5 GB model each time and, crucially, keeps it alive so its Core ML
+        // GPU resources aren't torn down on a background thread while the splat
+        // renderer is initializing.
+        let existingRunner = (cachedRunnerURL == modelURL) ? cachedRunner : nil
 
         Task.detached(priority: .userInitiated) {
             do {
-                let runner = try SharpModelRunner(modelURL: modelURL)
+                let runner = try existingRunner ?? SharpModelRunner(modelURL: modelURL)
+                await MainActor.run {
+                    self.cachedRunner = runner
+                    self.cachedRunnerURL = modelURL
+                }
 
                 await MainActor.run { self.stage = .generating("Preparing image…") }
                 let input = try runner.preprocess(cgImage)
@@ -135,7 +148,6 @@ final class AppModel: ObservableObject {
                     self.stage = .failed("Generation failed: \(error.localizedDescription)")
                 }
             }
-            await MainActor.run { ModelLocator.endAccess(modelURL) }
         }
     }
 
