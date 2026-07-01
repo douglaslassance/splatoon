@@ -127,7 +127,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 SplatViewer(url: splat)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Text("Drag to orbit · scroll or pinch to zoom")
+                Text("Drag to look · WASD to move · Q/E up-down · scroll to dolly · R to reset")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(6)

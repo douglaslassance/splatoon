@@ -1,11 +1,12 @@
 import SwiftUI
 import MetalKit
+import QuartzCore
 import simd
 import MetalSplatter
 import SplatIO
 
 /// SwiftUI wrapper around a Metal view that renders a Gaussian splat PLY using
-/// MetalSplatter, with an interactive orbit/zoom camera.
+/// MetalSplatter, with a free-fly camera (drag to look, WASD to move).
 struct SplatViewer: NSViewRepresentable {
     /// The splat file to display. Changing this reloads the scene.
     var url: URL?
@@ -15,7 +16,7 @@ struct SplatViewer: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> MTKView {
-        let view = OrbitMTKView()
+        let view = CameraMTKView()
         view.device = MTLCreateSystemDefaultDevice()
         view.coordinator = context.coordinator
         view.colorPixelFormat = .bgra8Unorm_srgb
@@ -28,6 +29,10 @@ struct SplatViewer: NSViewRepresentable {
         view.delegate = context.coordinator
         context.coordinator.configure(view)
         context.coordinator.load(url)
+        // Take keyboard focus so WASD works once the view is in a window.
+        DispatchQueue.main.async { [weak view] in
+            view?.window?.makeFirstResponder(view)
+        }
         return view
     }
 
@@ -36,23 +41,36 @@ struct SplatViewer: NSViewRepresentable {
     }
 }
 
-/// A Metal view that forwards mouse-drag and scroll events to the coordinator's
-/// orbit camera.
-final class OrbitMTKView: MTKView {
+/// A Metal view that forwards mouse and keyboard input to the fly camera.
+final class CameraMTKView: MTKView {
     weak var coordinator: SplatViewerCoordinator?
 
     override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
 
     override func mouseDragged(with event: NSEvent) {
-        coordinator?.orbit(deltaX: Float(event.deltaX), deltaY: Float(event.deltaY))
+        coordinator?.look(deltaX: Float(event.deltaX), deltaY: Float(event.deltaY))
     }
 
     override func scrollWheel(with event: NSEvent) {
-        coordinator?.zoom(delta: Float(event.scrollingDeltaY))
+        coordinator?.dolly(Float(event.scrollingDeltaY))
     }
 
     override func magnify(with event: NSEvent) {
-        coordinator?.pinch(magnification: Float(event.magnification))
+        coordinator?.dolly(Float(event.magnification) * 40)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Swallow (no system beep); repeats are ignored — we track held state.
+        if !event.isARepeat { coordinator?.keyChanged(event.keyCode, pressed: true) }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        coordinator?.keyChanged(event.keyCode, pressed: false)
     }
 }
 
@@ -67,35 +85,84 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
 
     private var drawableSize: CGSize = .zero
 
-    // Orbit camera state.
-    private var azimuth: Float = 0
-    private var elevation: Float = 0
-    private var distance: Float = 8
+    // Fly camera. Starts at the photo's viewpoint: at the origin, looking into
+    // the scene (-z after the OpenCV→OpenGL calibration below).
+    private var eye = SIMD3<Float>(0, 0, 0)
+    private var yaw: Float = 0     // radians, around world up (Y)
+    private var pitch: Float = 0   // radians, around camera right (X)
+
+    private var pressedKeys = Set<UInt16>()
+    private var lastFrameTime: CFTimeInterval?
 
     private let fovy: Float = 65 * .pi / 180
+    private let lookSensitivity: Float = 0.005
+    private let moveSpeed: Float = 8      // world units per second
+
+    // ANSI key codes (physical positions, layout-independent).
+    private enum Key {
+        static let w: UInt16 = 13, a: UInt16 = 0, s: UInt16 = 1, d: UInt16 = 2
+        static let q: UInt16 = 12, e: UInt16 = 14, r: UInt16 = 15
+    }
 
     func configure(_ view: MTKView) {
         self.device = view.device
         self.commandQueue = view.device?.makeCommandQueue()
     }
 
-    // MARK: - Camera controls
+    // MARK: - Input
 
-    func orbit(deltaX: Float, deltaY: Float) {
-        azimuth += deltaX * 0.01
-        elevation += deltaY * 0.01
+    func look(deltaX: Float, deltaY: Float) {
+        yaw += deltaX * lookSensitivity
+        pitch -= deltaY * lookSensitivity
         let limit: Float = .pi / 2 - 0.01
-        elevation = min(max(elevation, -limit), limit)
+        pitch = min(max(pitch, -limit), limit)
     }
 
-    func zoom(delta: Float) {
-        distance *= (1 - delta * 0.01)
-        distance = min(max(distance, 0.5), 100)
+    func dolly(_ amount: Float) {
+        eye += forwardVector * (amount * 0.05)
     }
 
-    func pinch(magnification: Float) {
-        distance *= (1 - magnification)
-        distance = min(max(distance, 0.5), 100)
+    func keyChanged(_ code: UInt16, pressed: Bool) {
+        if pressed {
+            if code == Key.r { resetCamera(); return }
+            pressedKeys.insert(code)
+        } else {
+            pressedKeys.remove(code)
+        }
+    }
+
+    private func resetCamera() {
+        eye = .zero
+        yaw = 0
+        pitch = 0
+    }
+
+    // MARK: - Camera basis
+
+    private var forwardVector: SIMD3<Float> {
+        SIMD3(cos(pitch) * sin(yaw), sin(pitch), -cos(pitch) * cos(yaw))
+    }
+
+    private func advanceCamera() {
+        let now = CACurrentMediaTime()
+        let dt = min(now - (lastFrameTime ?? now), 0.1)
+        lastFrameTime = now
+        guard !pressedKeys.isEmpty else { return }
+
+        let forward = forwardVector
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        let right = normalize(cross(forward, worldUp))
+
+        var move = SIMD3<Float>(0, 0, 0)
+        if pressedKeys.contains(Key.w) { move += forward }
+        if pressedKeys.contains(Key.s) { move -= forward }
+        if pressedKeys.contains(Key.d) { move += right }
+        if pressedKeys.contains(Key.a) { move -= right }
+        if pressedKeys.contains(Key.e) { move += worldUp }
+        if pressedKeys.contains(Key.q) { move -= worldUp }
+        if move != .zero {
+            eye += normalize(move) * (moveSpeed * Float(dt))
+        }
     }
 
     // MARK: - Loading
@@ -125,10 +192,8 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
                 let chunk = try SplatChunk(device: device, from: points)
                 _ = await newRenderer.addChunk(chunk)
                 if Task.isCancelled { return }
-                // Reset the camera for the new scene.
-                azimuth = 0
-                elevation = 0
-                distance = 8
+                resetCamera()
+                pressedKeys.removeAll()
                 renderer = newRenderer
             } catch {
                 if !Task.isCancelled {
@@ -145,6 +210,8 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        advanceCamera()
+
         guard let renderer, renderer.isReadyToRender,
               let commandQueue,
               let drawable = view.currentDrawable,
@@ -171,14 +238,16 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
 
     private func makeViewport() -> SplatRenderer.ViewportDescriptor {
         let aspect = Float(drawableSize.width / drawableSize.height)
-        let projection = perspectiveRightHand(fovy: fovy, aspect: aspect, nearZ: 0.1, farZ: 100)
+        let projection = perspectiveRightHand(fovy: fovy, aspect: aspect, nearZ: 0.1, farZ: 1000)
 
-        // Orbit around the origin; the calibration flips common 3DGS PLYs
-        // rightside-up (matches MetalSplatter's sample default).
-        let calibration = rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
-        let rot = rotation(radians: elevation, axis: SIMD3<Float>(1, 0, 0))
-            * rotation(radians: azimuth, axis: SIMD3<Float>(0, 1, 0))
-        let view = translation(0, 0, -distance) * rot * calibration
+        // SHARP outputs an OpenCV-convention scene (camera looks +z, +y down).
+        // Convert to OpenGL (looks -z, +y up) so the default view frames the
+        // scene exactly like the input photo. This is a proper rotation
+        // (π about X), so the splats are not mirrored.
+        let calibration = rotation(radians: .pi, axis: SIMD3<Float>(1, 0, 0))
+        let view = lookAtRightHand(eye: eye,
+                                   center: eye + forwardVector,
+                                   up: SIMD3<Float>(0, 1, 0)) * calibration
 
         return SplatRenderer.ViewportDescriptor(
             viewport: MTLViewport(originX: 0, originY: 0,
@@ -191,7 +260,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     }
 }
 
-// MARK: - Matrix helpers (right-handed; from Apple sample conventions)
+// MARK: - Matrix helpers (right-handed)
 
 private func rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
     let a = normalize(axis)
@@ -205,12 +274,15 @@ private func rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
     ))
 }
 
-private func translation(_ x: Float, _ y: Float, _ z: Float) -> matrix_float4x4 {
-    matrix_float4x4(columns: (
-        SIMD4<Float>(1, 0, 0, 0),
-        SIMD4<Float>(0, 1, 0, 0),
-        SIMD4<Float>(0, 0, 1, 0),
-        SIMD4<Float>(x, y, z, 1)
+private func lookAtRightHand(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> matrix_float4x4 {
+    let f = normalize(center - eye)
+    let s = normalize(cross(f, up))
+    let u = cross(s, f)
+    return matrix_float4x4(columns: (
+        SIMD4<Float>(s.x, u.x, -f.x, 0),
+        SIMD4<Float>(s.y, u.y, -f.y, 0),
+        SIMD4<Float>(s.z, u.z, -f.z, 0),
+        SIMD4<Float>(-dot(s, eye), -dot(u, eye), dot(f, eye), 1)
     ))
 }
 
