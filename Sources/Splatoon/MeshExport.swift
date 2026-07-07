@@ -14,7 +14,7 @@ import simd
 //   - position   (baked from the model's OpenCV convention into glTF's Y-up/-Z)
 //   - normal     (the Gaussian's flattest axis: its smallest-scale local axis
 //                 rotated by its quaternion)
-//   - colour     (linear RGB -> sRGB, matching the splat viewer)
+//   - colour     (linear RGB; glTF COLOR_0 is defined as linear)
 //
 // Triangles that straddle an occlusion boundary are culled using a relative
 // depth-jump test (scale-invariant, since scene depth spans ~2 to ~200), so the
@@ -70,9 +70,11 @@ enum MeshExporter {
             let length = simd_length(normal)
             normal = length > 1e-6 ? normal / length : SIMD3<Float>(0, 0, 1)
 
-            let r = colorToByte(linearRGBToSRGB(colorPtr[i * 3 + 0]))
-            let g = colorToByte(linearRGBToSRGB(colorPtr[i * 3 + 1]))
-            let b = colorToByte(linearRGBToSRGB(colorPtr[i * 3 + 2]))
+            // glTF COLOR_0 is defined as linear, and colorPtr is already linear
+            // RGB, so store it directly (no sRGB encoding, which would wash out).
+            let r = colorToByte(colorPtr[i * 3 + 0])
+            let g = colorToByte(colorPtr[i * 3 + 1])
+            let b = colorToByte(colorPtr[i * 3 + 2])
 
             return (position, normal, SIMD4<UInt8>(r, g, b, 255), rz, opacityPtr[i] > opacityThreshold)
         }
@@ -310,7 +312,7 @@ enum MeshExporter {
             ["bufferView": 2, "componentType": 5121, "count": vertexCount, "type": "VEC4", "normalized": true],
         ]
         let attributes: [String: Any] = ["POSITION": 0, "NORMAL": 1, "COLOR_0": 2]
-        var primitive: [String: Any] = ["attributes": attributes]
+        var primitive: [String: Any] = ["attributes": attributes, "material": 0]
 
         if idxCount > 0 {
             bufferViews.append(["buffer": 0, "byteOffset": idxOffset, "byteLength": idxLength, "target": 34963])
@@ -321,12 +323,28 @@ enum MeshExporter {
             primitive["mode"] = 0   // points
         }
 
+        // Unlit material so the vertex colours render fullbright (unaffected by
+        // scene lighting) rather than being shaded. glTF's COLOR_0 attribute can
+        // only multiply base colour, so this is the in-file way to get the
+        // self-lit look; true per-vertex emissive requires a custom shader.
+        let material: [String: Any] = [
+            "name": "SplatVertexColor",
+            "pbrMetallicRoughness": [
+                "baseColorFactor": [1, 1, 1, 1],
+                "metallicFactor": 0,
+                "roughnessFactor": 1,
+            ],
+            "extensions": ["KHR_materials_unlit": [String: Any]()],
+        ]
+
         let gltf: [String: Any] = [
             "asset": ["version": "2.0", "generator": "Splatoon"],
+            "extensionsUsed": ["KHR_materials_unlit"],
             "scene": 0,
             "scenes": [["nodes": [0]]],
             "nodes": [["mesh": 0, "name": "Splat"]],
             "meshes": [["primitives": [primitive]]],
+            "materials": [material],
             "buffers": [["byteLength": bin.count]],
             "bufferViews": bufferViews,
             "accessors": accessors,
