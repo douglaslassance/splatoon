@@ -14,7 +14,7 @@ final class GalleryModel: ObservableObject {
     struct OpenedSplat: Identifiable, Equatable {
         let id: String        // PHAsset.localIdentifier
         let title: String
-        let url: URL
+        let url: URL?         // nil while the splat is still being generated
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -109,6 +109,9 @@ final class GalleryModel: ObservableObject {
             return
         }
 
+        // Switch to the splat view immediately (url nil = still generating) so
+        // progress is shown there rather than over the gallery.
+        opened = OpenedSplat(id: identifier, title: title, url: nil)
         busyMessage = "Loading photo…"
         let requestOptions = PHImageRequestOptions()
         requestOptions.isNetworkAccessAllowed = true
@@ -121,6 +124,7 @@ final class GalleryModel: ObservableObject {
                 guard let data, let cgImage = Self.decodeOriented(data) else {
                     self.busyMessage = nil
                     self.errorMessage = "Could not load that photo."
+                    if self.opened?.id == identifier { self.opened = nil }
                     return
                 }
                 self.generate(cgImage: cgImage,
@@ -166,12 +170,17 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     self.splatIdentifiers.insert(identifier)
                     self.busyMessage = nil
-                    self.opened = OpenedSplat(id: identifier, title: title, url: destination)
+                    // Only reveal the splat if the user is still on this one
+                    // (they may have navigated back during generation).
+                    if self.opened?.id == identifier {
+                        self.opened = OpenedSplat(id: identifier, title: title, url: destination)
+                    }
                 }
             } catch {
                 await MainActor.run {
                     self.busyMessage = nil
                     self.errorMessage = "Generation failed: \(error.localizedDescription)"
+                    if self.opened?.id == identifier { self.opened = nil }
                 }
             }
         }
@@ -184,7 +193,7 @@ final class GalleryModel: ObservableObject {
     // MARK: - Export
 
     func exportOpened() {
-        guard let opened else { return }
+        guard let opened, let source = opened.url else { return }
         let panel = NSSavePanel()
         panel.title = "Export Splat"
         panel.nameFieldStringValue = (opened.title as NSString).deletingPathExtension + ".ply"
@@ -194,7 +203,7 @@ final class GalleryModel: ObservableObject {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
             }
-            try FileManager.default.copyItem(at: opened.url, to: destination)
+            try FileManager.default.copyItem(at: source, to: destination)
         } catch {
             errorMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -203,8 +212,7 @@ final class GalleryModel: ObservableObject {
     /// Export a triangle mesh (.glb), built on demand from the cached splat PLY so
     /// it always reflects the current meshing code (no re-inference needed).
     func exportMesh() {
-        guard let opened else { return }
-        let source = opened.url
+        guard let opened, let source = opened.url else { return }
         let panel = NSSavePanel()
         panel.title = "Export Mesh"
         panel.nameFieldStringValue = (opened.title as NSString).deletingPathExtension + ".glb"

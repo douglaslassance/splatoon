@@ -10,6 +10,8 @@ import SplatIO
 struct SplatViewer: NSViewRepresentable {
     /// The splat file to display. Changing this reloads the scene.
     var url: URL?
+    /// Called on the main actor as the scene starts and finishes loading.
+    var onLoadingChange: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> SplatViewerCoordinator {
         SplatViewerCoordinator()
@@ -28,6 +30,7 @@ struct SplatViewer: NSViewRepresentable {
         view.preferredFramesPerSecond = 60
         view.delegate = context.coordinator
         context.coordinator.configure(view)
+        context.coordinator.onLoadingChange = onLoadingChange
         context.coordinator.load(url)
         // Take keyboard focus so WASD works once the view is in a window.
         DispatchQueue.main.async { [weak view] in
@@ -37,6 +40,7 @@ struct SplatViewer: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
+        context.coordinator.onLoadingChange = onLoadingChange
         context.coordinator.load(url)
     }
 }
@@ -79,6 +83,8 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var renderer: SplatRenderer?
+
+    var onLoadingChange: (Bool) -> Void = { _ in }
 
     private var loadedURL: URL?
     private var loadTask: Task<Void, Never>?
@@ -173,11 +179,14 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
         loadTask?.cancel()
 
         guard let url, let device else {
+            // No file yet (e.g. still generating). Leave the loading state alone
+            // so the overlay is already up when a real URL arrives.
             renderer = nil
             return
         }
 
         loadTask = Task {
+            onLoadingChange(true)
             do {
                 let newRenderer = try SplatRenderer(
                     device: device,
@@ -191,13 +200,16 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
                 let points = try await reader.readAll()
                 let chunk = try SplatChunk(device: device, from: points)
                 _ = await newRenderer.addChunk(chunk)
+                // A newer load superseded this one; let it own the loading state.
                 if Task.isCancelled { return }
                 resetCamera()
                 pressedKeys.removeAll()
                 renderer = newRenderer
+                onLoadingChange(false)
             } catch {
                 if !Task.isCancelled {
                     print("SplatViewer failed to load \(url.lastPathComponent): \(error.localizedDescription)")
+                    onLoadingChange(false)
                 }
             }
         }

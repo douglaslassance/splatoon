@@ -5,12 +5,7 @@ struct ContentView: View {
     @StateObject private var model = GalleryModel()
 
     var body: some View {
-        ZStack {
-            content
-            if let message = model.busyMessage {
-                BusyOverlay(message: message)
-            }
-        }
+        content
         .frame(minWidth: 860, minHeight: 600)
         .onAppear { model.onAppear() }
         .alert("Something went wrong",
@@ -81,18 +76,3 @@ private struct AccessGate: View {
     }
 }
 
-private struct BusyOverlay: View {
-    let message: String
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.4).ignoresSafeArea()
-            VStack(spacing: 14) {
-                ProgressView().controlSize(.large)
-                Text(message).foregroundStyle(.white)
-            }
-            .padding(28)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        }
-    }
-}
