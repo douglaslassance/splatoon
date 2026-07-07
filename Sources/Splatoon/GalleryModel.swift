@@ -200,6 +200,32 @@ final class GalleryModel: ObservableObject {
         }
     }
 
+    /// Export a triangle mesh (.glb), built on demand from the cached splat PLY so
+    /// it always reflects the current meshing code (no re-inference needed).
+    func exportMesh() {
+        guard let opened else { return }
+        let source = opened.url
+        let panel = NSSavePanel()
+        panel.title = "Export Mesh"
+        panel.nameFieldStringValue = (opened.title as NSString).deletingPathExtension + ".glb"
+        panel.allowedContentTypes = [UTType(filenameExtension: "glb") ?? .data]
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        busyMessage = "Building mesh…"
+        Task.detached(priority: .userInitiated) {
+            do {
+                let gaussians = try SplatPLYReader.readGaussians(from: source)
+                try MeshExporter.saveGLB(gaussians: gaussians, to: destination)
+                await MainActor.run { self.busyMessage = nil }
+            } catch {
+                await MainActor.run {
+                    self.busyMessage = nil
+                    self.errorMessage = "Mesh export failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private static func title(for asset: PHAsset) -> String {

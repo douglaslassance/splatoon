@@ -29,8 +29,9 @@ struct SplatDetailView: View {
 
             Spacer()
 
-            Button {
-                model.exportOpened()
+            Menu {
+                Button("Splat (.ply)") { model.exportOpened() }
+                Button("Mesh (.glb)") { model.exportMesh() }
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
