@@ -3,6 +3,7 @@ import Photos
 
 struct GalleryView: View {
     @ObservedObject var model: GalleryModel
+    @EnvironmentObject var settings: MeshSettings
 
     private let columns = [GridItem(.adaptive(minimum: 130), spacing: 2)]
 
@@ -13,7 +14,9 @@ struct GalleryView: View {
                     ThumbnailCell(asset: asset,
                                   imageManager: model.imageManager,
                                   hasSplat: model.hasSplat(asset))
-                        .onTapGesture(count: 2) { model.open(asset) }
+                        .onTapGesture(count: 2) {
+                            model.open(asset, allowMultiImage: settings.useMultiImageReconstruction)
+                        }
                         .help("Double-click to open its 3D splat")
                 }
             }

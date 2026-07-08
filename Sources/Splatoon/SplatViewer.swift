@@ -60,6 +60,14 @@ final class CameraMTKView: MTKView {
         coordinator?.look(deltaX: Float(event.deltaX), deltaY: Float(event.deltaY))
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        coordinator?.pan(deltaX: Float(event.deltaX), deltaY: Float(event.deltaY))
+    }
+
     override func scrollWheel(with event: NSEvent) {
         coordinator?.dolly(Float(event.scrollingDeltaY))
     }
@@ -103,6 +111,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     private let fovy: Float = 65 * .pi / 180
     private let lookSensitivity: Float = 0.005
     private let moveSpeed: Float = 8      // world units per second
+    private let panSensitivity: Float = 8 * 0.002   // world units per pixel dragged
 
     // ANSI key codes (physical positions, layout-independent).
     private enum Key {
@@ -126,6 +135,14 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
 
     func dolly(_ amount: Float) {
         eye += forwardVector * (amount * 0.05)
+    }
+
+    /// Translate the camera along its screen-space right/up axes, right-drag —
+    /// the world follows the cursor, like a grab-and-drag hand tool.
+    func pan(deltaX: Float, deltaY: Float) {
+        let right = normalize(cross(forwardVector, SIMD3<Float>(0, 1, 0)))
+        eye -= right * (deltaX * panSensitivity)
+        eye += SIMD3<Float>(0, 1, 0) * (deltaY * panSensitivity)
     }
 
     func keyChanged(_ code: UInt16, pressed: Bool) {

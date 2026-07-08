@@ -101,16 +101,21 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Open / generate
 
-    func open(_ asset: PHAsset) {
+    /// Open a photo. When `allowMultiImage` is true (the default; gated by the
+    /// "Reconstruct multi-image scenes" setting) and the photo has enough
+    /// same-place/time siblings, they're reconstructed together as one
+    /// multi-view scene. Otherwise this photo alone goes through single-image
+    /// SHARP.
+    func open(_ asset: PHAsset, allowMultiImage: Bool = true) {
         errorMessage = nil
         resetOpenedMesh()
 
-        // If this photo is one of several capturing the same place/moment, use
-        // them together (multi-view). Otherwise fall through to single-image SHARP.
-        let group = SceneGrouping.neighbors(of: asset, in: assets)
-        if SceneGrouping.isScene(group) {
-            openScene(group)
-            return
+        if allowMultiImage {
+            let group = SceneGrouping.neighbors(of: asset, in: assets)
+            if SceneGrouping.isScene(group) {
+                openScene(group)
+                return
+            }
         }
 
         let identifier = asset.localIdentifier

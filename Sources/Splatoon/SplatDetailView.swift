@@ -129,9 +129,7 @@ struct SplatDetailView: View {
     }
 
     private var hint: some View {
-        Text(viewMode == .splat
-             ? "Drag to look · WASD to move · Q/E up-down · scroll to dolly · R to reset"
-             : "Drag to orbit · scroll to zoom")
+        Text("Drag to look · Right-drag to pan · WASD to move · Q/E up-down · Scroll to dolly · R to reset")
             .font(.caption)
             .foregroundStyle(.secondary)
             .padding(8)

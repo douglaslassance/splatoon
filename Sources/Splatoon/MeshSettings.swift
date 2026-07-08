@@ -13,7 +13,7 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .grid: return "Grid surface"
+        case .grid: return "Grid surface (single-image only)"
         case .surfel: return "Surfels (per-splat quads)"
         case .poisson: return "Poisson reconstruction"
         }
@@ -22,11 +22,12 @@ enum MeshMethod: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .grid:
-            return "Connects the splat grid into a single 2.5D surface. Fast, on-device."
+            return "Connects the splat grid into a single 2.5D surface. Fast, on-device. "
+                + "Needs a single-image splat's structured grid; multi-image scenes fall back to Poisson automatically."
         case .surfel:
-            return "Emits one oriented quad per splat. Faithful to each splat's shape, but not a connected surface."
+            return "Emits one oriented quad per splat. Faithful to each splat's shape, but not a connected surface. Works for single- and multi-image splats."
         case .poisson:
-            return "Volumetric reconstruction (TSDF + marching tetrahedra) from the oriented point cloud. Smoother and hole-filled; on-device stand-in for screened Poisson."
+            return "Volumetric reconstruction (TSDF + marching tetrahedra) from the oriented point cloud. Smoother and hole-filled; on-device stand-in for screened Poisson. Works for single- and multi-image splats."
         }
     }
 }
@@ -34,6 +35,13 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 /// User-selectable mesh export settings, persisted across launches.
 @MainActor
 final class MeshSettings: ObservableObject {
+    /// When true, opening a photo with several same-place/time siblings
+    /// reconstructs them together as a multi-view scene (COLMAP + OpenSplat)
+    /// instead of using only the tapped photo. Off falls back to single-image
+    /// (SHARP) for every photo.
+    @Published var useMultiImageReconstruction: Bool {
+        didSet { defaults.set(useMultiImageReconstruction, forKey: Keys.useMultiImageReconstruction) }
+    }
     @Published var method: MeshMethod {
         didSet { defaults.set(method.rawValue, forKey: Keys.method) }
     }
@@ -62,6 +70,7 @@ final class MeshSettings: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private enum Keys {
+        static let useMultiImageReconstruction = "reconstruction.useMultiImage"
         static let method = "mesh.method"
         static let smoothGrid = "mesh.smoothGrid"
         static let depthRatioCull = "mesh.depthRatioCull"
@@ -70,6 +79,7 @@ final class MeshSettings: ObservableObject {
     }
 
     init() {
+        useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
         let raw = defaults.string(forKey: Keys.method) ?? MeshMethod.grid.rawValue
         method = MeshMethod(rawValue: raw) ?? .grid
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false

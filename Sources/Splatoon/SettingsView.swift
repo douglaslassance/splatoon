@@ -8,6 +8,7 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                sceneDetectionCard
                 methodCard
                 optionsCard
             }
@@ -15,6 +16,22 @@ struct SettingsView: View {
         }
         .frame(width: 460)
         .frame(minHeight: 360)
+    }
+
+    private var sceneDetectionCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Reconstruct multi-image scenes", isOn: $settings.useMultiImageReconstruction)
+                Text("When a photo has several same-place/time siblings, combine them into one "
+                     + "multi-view splat (COLMAP + OpenSplat) instead of using just the tapped photo. "
+                     + "Off always uses single-image reconstruction.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(6)
+        } label: {
+            Text("Scene detection").font(.headline)
+        }
     }
 
     private var methodCard: some View {
