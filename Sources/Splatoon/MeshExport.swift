@@ -15,8 +15,19 @@ import simd
 // linear-RGB colour (glTF COLOR_0 is linear). Output is binary glTF (.glb) with a
 // KHR_materials_unlit material so colours render fullbright in Unity/glTFast.
 
+/// A triangle mesh ready to serialize (.glb) or render (SceneKit). Colours are
+/// per-vertex linear RGBA bytes (glTF COLOR_0 convention); `indices` is empty for
+/// a bare point cloud.
+struct Mesh {
+    var positions: [SIMD3<Float>]
+    var normals: [SIMD3<Float>]
+    var colors: [SIMD4<UInt8>]
+    var indices: [UInt32]
+}
+
 enum MeshExporter {
 
+    /// Build a triangle mesh from Gaussians, then write it as binary glTF (.glb).
     static func saveGLB(gaussians: Gaussians3D,
                         to outputURL: URL,
                         method: MeshMethod = .grid,
@@ -25,6 +36,22 @@ enum MeshExporter {
                         surfelExtent: Float = 2.0,
                         poissonResolution: Int = 256,
                         opacityThreshold: Float = 0.05) throws {
+        let mesh = buildMesh(gaussians: gaussians, method: method, smoothGrid: smoothGrid,
+                             depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
+                             poissonResolution: poissonResolution, opacityThreshold: opacityThreshold)
+        try writeGLB(positions: mesh.positions, normals: mesh.normals, colors: mesh.colors,
+                     indices: mesh.indices.isEmpty ? nil : mesh.indices, to: outputURL)
+    }
+
+    /// Build a triangle mesh from Gaussians using the chosen strategy. Shared by
+    /// the .glb writer and the in-app SceneKit viewer so both show the same surface.
+    static func buildMesh(gaussians: Gaussians3D,
+                          method: MeshMethod = .grid,
+                          smoothGrid: Bool = false,
+                          depthRatioCull: Float = 1.5,
+                          surfelExtent: Float = 2.0,
+                          poissonResolution: Int = 256,
+                          opacityThreshold: Float = 0.05) -> Mesh {
 
         let n = gaussians.count
         let meanPtr = gaussians.meanVectors.dataPointer.assumingMemoryBound(to: Float.self)
@@ -116,8 +143,7 @@ enum MeshExporter {
         print("MeshExporter[\(method.rawValue)]: \(n) Gaussians -> "
               + "\(positions.count) vertices, \(indices.count / 3) triangles")
 
-        try writeGLB(positions: positions, normals: normals, colors: colors,
-                     indices: indices.isEmpty ? nil : indices, to: outputURL)
+        return Mesh(positions: positions, normals: normals, colors: colors, indices: indices)
     }
 
     // MARK: - Grid surface

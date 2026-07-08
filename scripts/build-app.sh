@@ -69,6 +69,16 @@ else
   echo "warning: Metal resources not found; viewer shaders will be missing" >&2
 fi
 
+# Optional: bundle the reconstruction helper binaries (colmap/opensplat) if a
+# top-level tools/ directory is present. ToolLocator resolves them from
+# Contents/Resources/bin at runtime. Most setups instead install them outside
+# the app via scripts/fetch-tools.sh, so this is skipped when tools/ is absent.
+if [ -d "$ROOT/tools" ]; then
+  echo "==> Bundling reconstruction tools from tools/"
+  mkdir -p "$APP/Contents/Resources/bin"
+  cp -R "$ROOT/tools/." "$APP/Contents/Resources/bin/"
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -12,9 +12,10 @@ import UniformTypeIdentifiers
 final class GalleryModel: ObservableObject {
 
     struct OpenedSplat: Identifiable, Equatable {
-        let id: String        // PHAsset.localIdentifier
+        let id: String        // PHAsset.localIdentifier, or a scene key
         let title: String
         let url: URL?         // nil while the splat is still being generated
+        var isScene = false   // reconstructed from multiple photos (unstructured)
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -25,6 +26,12 @@ final class GalleryModel: ObservableObject {
     @Published private(set) var busyMessage: String?
     @Published var errorMessage: String?
 
+    /// The mesh preview for the currently opened splat, built lazily when the
+    /// detail view switches to Mesh mode. `openedMeshKey` identifies which
+    /// (splat, mesh-settings) combination it was built for.
+    @Published private(set) var openedMesh: Mesh?
+    private var openedMeshKey: String?
+
     /// Fraction of Gaussians to keep (1.0 = all).
     var decimation: Float = 1.0
 
@@ -33,6 +40,7 @@ final class GalleryModel: ObservableObject {
     private let cacheDir: URL
     private var cachedRunner: SharpModelRunner?
     private var cachedRunnerURL: URL?
+    private var sceneReconstructor: MultiImageReconstructor?
 
     init() {
         cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -95,6 +103,16 @@ final class GalleryModel: ObservableObject {
 
     func open(_ asset: PHAsset) {
         errorMessage = nil
+        resetOpenedMesh()
+
+        // If this photo is one of several capturing the same place/moment, use
+        // them together (multi-view). Otherwise fall through to single-image SHARP.
+        let group = SceneGrouping.neighbors(of: asset, in: assets)
+        if SceneGrouping.isScene(group) {
+            openScene(group)
+            return
+        }
+
         let identifier = asset.localIdentifier
         let destination = splatURL(for: identifier)
         let title = Self.title(for: asset)
@@ -188,6 +206,160 @@ final class GalleryModel: ObservableObject {
 
     func closeOpened() {
         opened = nil
+        resetOpenedMesh()
+        sceneReconstructor?.cancel()   // stop any in-flight reconstruction
+        sceneReconstructor = nil
+    }
+
+    // MARK: - Multi-image scene reconstruction
+
+    /// Reconstruct a splat from several photos of the same scene (COLMAP +
+    /// OpenSplat), caching the result like a single-image splat.
+    private func openScene(_ group: [PHAsset]) {
+        let key = SceneGrouping.sceneKey(for: group)
+        let destination = splatURL(for: key)
+        let title = "Scene · \(group.count) photos"
+
+        if FileManager.default.fileExists(atPath: destination.path) {
+            opened = OpenedSplat(id: key, title: title, url: destination, isScene: true)
+            return
+        }
+
+        // Resolve the external tools (prompting once if needed).
+        guard let colmap = ToolLocator.resolveOrPrompt(for: .colmap),
+              let trainer = ToolLocator.resolveOrPrompt(for: .opensplat) else {
+            errorMessage = "Multi-image reconstruction needs COLMAP and OpenSplat. "
+                + "Run scripts/fetch-tools.sh, then try again."
+            return
+        }
+
+        opened = OpenedSplat(id: key, title: title, url: nil, isScene: true)
+        busyMessage = "Found \(group.count) related photos — reconstructing scene…"
+
+        let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
+        sceneReconstructor = reconstructor
+        let assets = group
+
+        Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let workDir = fm.temporaryDirectory.appendingPathComponent("Splatoon/\(key)", isDirectory: true)
+            let imagesDir = workDir.appendingPathComponent("photos", isDirectory: true)
+            try? fm.removeItem(at: workDir)
+            try? fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+
+            do {
+                await MainActor.run { self.busyMessage = "Preparing \(assets.count) photos…" }
+                var written = 0
+                for (index, asset) in assets.enumerated() {
+                    if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
+                }
+                guard written >= SceneGrouping.minSceneSize else {
+                    throw MultiImageReconstructor.ReconstructionError.noSparseModel
+                }
+
+                try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination) { message in
+                    Task { @MainActor in
+                        if self.opened?.id == key { self.busyMessage = message }
+                    }
+                }
+
+                await MainActor.run {
+                    self.sceneReconstructor = nil
+                    self.splatIdentifiers.insert(key)
+                    self.busyMessage = nil
+                    if self.opened?.id == key {
+                        self.opened = OpenedSplat(id: key, title: title, url: destination, isScene: true)
+                    }
+                }
+                try? fm.removeItem(at: workDir)
+            } catch {
+                await MainActor.run {
+                    self.sceneReconstructor = nil
+                    self.busyMessage = nil
+                    if case MultiImageReconstructor.ReconstructionError.cancelled = error {
+                        // User navigated back mid-run; stay silent.
+                    } else {
+                        self.errorMessage = "Scene reconstruction failed: \(error.localizedDescription)"
+                        if self.opened?.id == key { self.opened = nil }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Export one Photos asset to a JPEG in `dir`, orientation baked in so COLMAP
+    /// reads it upright. Returns whether the write succeeded.
+    private func exportSceneImage(_ asset: PHAsset, to dir: URL, index: Int) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            options.isSynchronous = false
+            imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                guard let data, let cgImage = Self.decodeOriented(data) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let url = dir.appendingPathComponent(String(format: "img_%04d.jpg", index))
+                continuation.resume(returning: Self.writeJPEG(cgImage, to: url))
+            }
+        }
+    }
+
+    private nonisolated static func writeJPEG(_ image: CGImage, to url: URL) -> Bool {
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else { return false }
+        CGImageDestinationAddImage(destination, image,
+                                   [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        return CGImageDestinationFinalize(destination)
+    }
+
+    private func resetOpenedMesh() {
+        openedMesh = nil
+        openedMeshKey = nil
+    }
+
+    // MARK: - Mesh preview
+
+    /// Build (or reuse) the mesh preview for the opened splat with the given
+    /// settings. Reads the cached PLY and meshes it off the main thread, so the
+    /// preview always reflects the current meshing code without re-running SHARP.
+    func buildOpenedMesh(settingsSignature: String,
+                         method: MeshMethod,
+                         smoothGrid: Bool,
+                         depthRatioCull: Float,
+                         surfelExtent: Float,
+                         poissonResolution: Int) {
+        guard let opened, let source = opened.url else { return }
+        let key = "\(opened.id)|\(settingsSignature)"
+        if openedMeshKey == key, openedMesh != nil { return }   // already current
+
+        // The grid method needs SHARP's structured image grid; unstructured scene
+        // splats have none, so mesh them volumetrically instead.
+        let method = Self.effectiveMethod(method, isScene: opened.isScene)
+
+        openedMesh = nil
+        openedMeshKey = key
+        busyMessage = "Building mesh…"
+        Task.detached(priority: .userInitiated) {
+            do {
+                let gaussians = try SplatPLYReader.readGaussians(from: source)
+                let mesh = MeshExporter.buildMesh(gaussians: gaussians, method: method,
+                                                  smoothGrid: smoothGrid, depthRatioCull: depthRatioCull,
+                                                  surfelExtent: surfelExtent, poissonResolution: poissonResolution)
+                await MainActor.run {
+                    guard self.openedMeshKey == key else { return }  // superseded meanwhile
+                    self.openedMesh = mesh
+                    self.busyMessage = nil
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.openedMeshKey == key else { return }
+                    self.busyMessage = nil
+                    self.errorMessage = "Mesh build failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     // MARK: - Export
@@ -223,6 +395,7 @@ final class GalleryModel: ObservableObject {
         panel.allowedContentTypes = [UTType(filenameExtension: "glb") ?? .data]
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
+        let method = Self.effectiveMethod(method, isScene: opened.isScene)
         busyMessage = "Building mesh…"
         Task.detached(priority: .userInitiated) {
             do {
@@ -242,6 +415,12 @@ final class GalleryModel: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// The grid method assumes SHARP's structured image grid. Scene splats are
+    /// unstructured, so fall back to volumetric (poisson) meshing for them.
+    private static func effectiveMethod(_ method: MeshMethod, isScene: Bool) -> MeshMethod {
+        (isScene && method == .grid) ? .poisson : method
+    }
 
     private static func title(for asset: PHAsset) -> String {
         PHAssetResource.assetResources(for: asset).first?.originalFilename ?? "Splat"

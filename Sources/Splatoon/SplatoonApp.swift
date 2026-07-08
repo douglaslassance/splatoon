@@ -13,6 +13,9 @@ struct SplatoonApp: App {
         if CommandLine.arguments.contains("--selftest-mesh") {
             runMeshSelfTest()
         }
+        if CommandLine.arguments.contains("--selftest-scene") {
+            runSceneSelfTest()
+        }
     }
 
     var body: some Scene {
@@ -49,6 +52,45 @@ private func runMeshSelfTest() -> Never {
         exit(0)
     } catch {
         print("SELFTEST mesh failed: \(error)")
+        exit(1)
+    }
+}
+
+/// Runs the multi-image reconstruction pipeline (COLMAP + OpenSplat) headlessly
+/// over a directory of images, for end-to-end verification without the GUI.
+/// Usage: `Splatoon --selftest-scene <imagesDir> <out.ply> [iterations]`.
+private func runSceneSelfTest() -> Never {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: "--selftest-scene"), args.count > idx + 2 else {
+        print("SELFTEST scene: usage --selftest-scene <imagesDir> <out.ply> [iterations]")
+        exit(1)
+    }
+    let imagesDir = URL(fileURLWithPath: args[idx + 1])
+    let out = URL(fileURLWithPath: args[idx + 2])
+    let iterations = (args.count > idx + 3 ? Int(args[idx + 3]) : nil) ?? 1000
+
+    guard let colmap = ToolLocator.resolvedURL(for: .colmap) else {
+        print("SELFTEST scene: colmap not found (set SPLATOON_COLMAP or install it)"); exit(1)
+    }
+    guard let trainer = ToolLocator.resolvedURL(for: .opensplat) else {
+        print("SELFTEST scene: opensplat not found (set SPLATOON_OPENSPLAT or build it)"); exit(1)
+    }
+
+    let workDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("splatoon-selftest-scene", isDirectory: true)
+    try? FileManager.default.removeItem(at: workDir)
+    try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+    let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
+    reconstructor.trainingIterations = iterations
+    do {
+        try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: out) { message in
+            print("SELFTEST scene: \(message)")
+        }
+        print("SELFTEST scene OK -> \(out.path)")
+        exit(0)
+    } catch {
+        print("SELFTEST scene failed: \(error)")
         exit(1)
     }
 }

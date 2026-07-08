@@ -54,6 +54,12 @@ final class MeshSettings: ObservableObject {
         didSet { defaults.set(poissonResolution, forKey: Keys.poissonResolution) }
     }
 
+    /// Changes whenever any meshing-relevant setting changes; used to key the
+    /// in-app mesh preview cache so it rebuilds when the user tweaks settings.
+    var signature: String {
+        "\(method.rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)|\(poissonResolution)"
+    }
+
     private let defaults = UserDefaults.standard
     private enum Keys {
         static let method = "mesh.method"
