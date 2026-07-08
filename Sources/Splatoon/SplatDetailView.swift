@@ -4,6 +4,7 @@ import SwiftUI
 /// and export.
 struct SplatDetailView: View {
     @ObservedObject var model: GalleryModel
+    @EnvironmentObject var settings: MeshSettings
     let opened: GalleryModel.OpenedSplat
     @State private var isLoading = true
 
@@ -57,7 +58,13 @@ struct SplatDetailView: View {
 
             Menu {
                 Button("Splat (.ply)") { model.exportOpened() }
-                Button("Mesh (.glb)") { model.exportMesh() }
+                Button("Mesh (.glb)") {
+                    model.exportMesh(method: settings.method,
+                                     smoothGrid: settings.smoothGrid,
+                                     depthRatioCull: Float(settings.depthRatioCull),
+                                     surfelExtent: Float(settings.surfelExtent),
+                                     poissonResolution: Int(settings.poissonResolution))
+                }
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }

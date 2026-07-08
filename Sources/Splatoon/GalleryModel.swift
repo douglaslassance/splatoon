@@ -211,7 +211,11 @@ final class GalleryModel: ObservableObject {
 
     /// Export a triangle mesh (.glb), built on demand from the cached splat PLY so
     /// it always reflects the current meshing code (no re-inference needed).
-    func exportMesh() {
+    func exportMesh(method: MeshMethod,
+                    smoothGrid: Bool,
+                    depthRatioCull: Float,
+                    surfelExtent: Float,
+                    poissonResolution: Int) {
         guard let opened, let source = opened.url else { return }
         let panel = NSSavePanel()
         panel.title = "Export Mesh"
@@ -223,7 +227,10 @@ final class GalleryModel: ObservableObject {
         Task.detached(priority: .userInitiated) {
             do {
                 let gaussians = try SplatPLYReader.readGaussians(from: source)
-                try MeshExporter.saveGLB(gaussians: gaussians, to: destination)
+                try MeshExporter.saveGLB(gaussians: gaussians, to: destination,
+                                         method: method, smoothGrid: smoothGrid,
+                                         depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
+                                         poissonResolution: poissonResolution)
                 await MainActor.run { self.busyMessage = nil }
             } catch {
                 await MainActor.run {
