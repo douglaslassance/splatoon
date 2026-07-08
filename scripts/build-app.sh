@@ -27,6 +27,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN_DIR/$EXECUTABLE" "$APP/Contents/MacOS/$EXECUTABLE"
 
+# App icon. Regenerate with:
+#   swift Resources/make_icon.swift
+#   iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns
+#   rm -rf Resources/AppIcon.iconset
+if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
+  cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+fi
+
 # Copy SwiftPM resource bundles into Contents/Resources (a valid, signable
 # location). MetalSplatter ships its shaders in a *_MetalSplatter.bundle.
 shopt -s nullglob
@@ -70,6 +78,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>Splatoon</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$EXECUTABLE</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
