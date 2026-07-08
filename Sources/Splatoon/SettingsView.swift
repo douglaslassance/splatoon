@@ -20,18 +20,33 @@ struct SettingsView: View {
 
     private var sceneDetectionCard: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("Reconstruct multi-image scenes", isOn: $settings.useMultiImageReconstruction)
-                Text("When a photo has several same-place/time siblings, combine them into one "
-                     + "multi-view splat (COLMAP + OpenSplat) instead of using just the tapped photo. "
-                     + "Off always uses single-image reconstruction.")
-                    .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Reconstruct multi-image scenes", isOn: $settings.useMultiImageReconstruction)
+                    Text("When a photo has several same-place/time siblings, combine them into one "
+                         + "multi-view splat (COLMAP + OpenSplat) instead of using just the tapped photo. "
+                         + "Off always uses single-image reconstruction.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                sliderRow(title: "Training steps",
+                          valueText: "\(Int(settings.multiImageIterations)) (~\(estimatedMinutes) min)",
+                          value: $settings.multiImageIterations, range: 1000...30000, step: 500,
+                          caption: "How long the multi-view trainer runs. Too few steps and the splat "
+                              + "stays blurry — densification only starts after step 500, and quality keeps "
+                              + "improving well past 15000. Higher is sharper but slower. The time is a rough "
+                              + "estimate (~13 steps/sec) — actual speed depends on your Mac.")
+                    .disabled(!settings.useMultiImageReconstruction)
+                    .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(6)
         } label: {
             Text("Scene detection").font(.headline)
         }
+    }
+
+    private var estimatedMinutes: Int {
+        max(1, Int((settings.multiImageIterations / 12.85 / 60).rounded()))
     }
 
     private var methodCard: some View {

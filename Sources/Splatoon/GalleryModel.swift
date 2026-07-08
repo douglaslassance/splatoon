@@ -16,6 +16,22 @@ final class GalleryModel: ObservableObject {
         let title: String
         let url: URL?         // nil while the splat is still being generated
         var isScene = false   // reconstructed from multiple photos (unstructured)
+        /// Where the fly camera should start. nil for SHARP splats (world origin
+        /// already is the photo's own viewpoint); a real registered camera pose
+        /// for scenes (COLMAP's world origin is otherwise arbitrary).
+        var initialPose: ScenePose?
+    }
+
+    /// Live status of a background multi-image reconstruction, independent of
+    /// `opened`/navigation — it keeps running (and this keeps updating) even
+    /// after the user backs out to the gallery, so a docked progress bar can
+    /// show it regardless of what's currently on screen.
+    struct SceneProgress: Equatable {
+        var key: String
+        var title: String
+        var stageLabel: String
+        var fraction: Double     // 0...1 across the whole pipeline
+        var isComplete = false
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -24,6 +40,7 @@ final class GalleryModel: ObservableObject {
     @Published private(set) var splatIdentifiers: Set<String> = []
     @Published var opened: OpenedSplat?
     @Published private(set) var busyMessage: String?
+    @Published private(set) var sceneProgress: SceneProgress?
     @Published var errorMessage: String?
 
     /// The mesh preview for the currently opened splat, built lazily when the
@@ -104,16 +121,16 @@ final class GalleryModel: ObservableObject {
     /// Open a photo. When `allowMultiImage` is true (the default; gated by the
     /// "Reconstruct multi-image scenes" setting) and the photo has enough
     /// same-place/time siblings, they're reconstructed together as one
-    /// multi-view scene. Otherwise this photo alone goes through single-image
-    /// SHARP.
-    func open(_ asset: PHAsset, allowMultiImage: Bool = true) {
+    /// multi-view scene, trained for `multiImageIterations` steps. Otherwise
+    /// this photo alone goes through single-image SHARP.
+    func open(_ asset: PHAsset, allowMultiImage: Bool = true, multiImageIterations: Int = 15000) {
         errorMessage = nil
         resetOpenedMesh()
 
         if allowMultiImage {
             let group = SceneGrouping.neighbors(of: asset, in: assets)
             if SceneGrouping.isScene(group) {
-                openScene(group)
+                openScene(group, iterations: multiImageIterations)
                 return
             }
         }
@@ -209,24 +226,61 @@ final class GalleryModel: ObservableObject {
         }
     }
 
+    /// Navigate back to the gallery. Any in-flight scene reconstruction keeps
+    /// running in the background — `sceneProgress` keeps updating regardless —
+    /// so a long training run isn't lost just by looking at something else.
     func closeOpened() {
         opened = nil
         resetOpenedMesh()
-        sceneReconstructor?.cancel()   // stop any in-flight reconstruction
-        sceneReconstructor = nil
+    }
+
+    /// Stop the in-flight reconstruction, if any (the docked progress bar's
+    /// Cancel button). Unlike navigating away, this really does discard it.
+    func cancelSceneReconstruction() {
+        sceneReconstructor?.cancel()
+    }
+
+    /// Bring the scene tracked by `sceneProgress` back on screen — either its
+    /// still-generating placeholder (drives the same in-context progress view)
+    /// or, once cached, the finished splat.
+    func reopenInProgressScene() {
+        guard let progress = sceneProgress else { return }
+        let destination = splatURL(for: progress.key)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            opened = OpenedSplat(id: progress.key, title: progress.title, url: destination, isScene: true,
+                                 initialPose: MultiImageReconstructor.initialPose(for: destination))
+        } else {
+            opened = OpenedSplat(id: progress.key, title: progress.title, url: nil, isScene: true)
+        }
+    }
+
+    /// Dismiss the "Ready" state of a finished reconstruction without opening it.
+    func dismissSceneProgress() {
+        sceneProgress = nil
     }
 
     // MARK: - Multi-image scene reconstruction
 
     /// Reconstruct a splat from several photos of the same scene (COLMAP +
-    /// OpenSplat), caching the result like a single-image splat.
-    private func openScene(_ group: [PHAsset]) {
-        let key = SceneGrouping.sceneKey(for: group)
+    /// OpenSplat), caching the result like a single-image splat. Runs to
+    /// completion in the background regardless of navigation; `sceneProgress`
+    /// tracks it independently of `opened` so a docked bar can show it from
+    /// anywhere in the app.
+    private func openScene(_ group: [PHAsset], iterations: Int) {
+        // Iteration count is part of the cache key so raising it in Settings and
+        // reopening actually retrains, instead of silently reusing a blurrier cache.
+        let key = SceneGrouping.sceneKey(for: group) + "-i\(iterations)"
         let destination = splatURL(for: key)
         let title = "Scene · \(group.count) photos"
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            opened = OpenedSplat(id: key, title: title, url: destination, isScene: true)
+            opened = OpenedSplat(id: key, title: title, url: destination, isScene: true,
+                                 initialPose: MultiImageReconstructor.initialPose(for: destination))
+            return
+        }
+
+        guard sceneReconstructor == nil else {
+            errorMessage = "A scene is already reconstructing. Wait for it to finish, or cancel it from the progress bar."
             return
         }
 
@@ -239,9 +293,11 @@ final class GalleryModel: ObservableObject {
         }
 
         opened = OpenedSplat(id: key, title: title, url: nil, isScene: true)
-        busyMessage = "Found \(group.count) related photos — reconstructing scene…"
+        sceneProgress = SceneProgress(key: key, title: title,
+                                      stageLabel: "Found \(group.count) related photos…", fraction: 0)
 
         let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
+        reconstructor.trainingIterations = iterations
         sceneReconstructor = reconstructor
         let assets = group
 
@@ -253,38 +309,55 @@ final class GalleryModel: ObservableObject {
             try? fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
 
             do {
-                await MainActor.run { self.busyMessage = "Preparing \(assets.count) photos…" }
+                // Preparing photos: the first 5% of the overall bar.
                 var written = 0
                 for (index, asset) in assets.enumerated() {
                     if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
+                    let fraction = Double(index + 1) / Double(assets.count) * 0.05
+                    await MainActor.run {
+                        guard self.sceneProgress?.key == key else { return }
+                        self.sceneProgress?.stageLabel = "Preparing \(assets.count) photos…"
+                        self.sceneProgress?.fraction = fraction
+                    }
                 }
                 guard written >= SceneGrouping.minSceneSize else {
                     throw MultiImageReconstructor.ReconstructionError.noSparseModel
                 }
 
-                try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination) { message in
+                // COLMAP + training: the remaining 95%.
+                try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination,
+                                      totalImages: assets.count) { update in
                     Task { @MainActor in
-                        if self.opened?.id == key { self.busyMessage = message }
+                        guard self.sceneProgress?.key == key else { return }
+                        self.sceneProgress?.stageLabel = update.stageLabel
+                        self.sceneProgress?.fraction = 0.05 + 0.95 * update.fraction
                     }
                 }
 
+                let initialPose = MultiImageReconstructor.initialPose(for: destination)
                 await MainActor.run {
                     self.sceneReconstructor = nil
                     self.splatIdentifiers.insert(key)
-                    self.busyMessage = nil
                     if self.opened?.id == key {
-                        self.opened = OpenedSplat(id: key, title: title, url: destination, isScene: true)
+                        self.opened = OpenedSplat(id: key, title: title, url: destination, isScene: true,
+                                                  initialPose: initialPose)
                     }
+                    // Leave a brief "Ready" state on the docked bar so a user who
+                    // wandered off notices it finished; tapping or a new scene
+                    // request clears it (see reopenInProgressScene/dismiss).
+                    self.sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Ready",
+                                                       fraction: 1, isComplete: true)
                 }
                 try? fm.removeItem(at: workDir)
             } catch {
                 await MainActor.run {
                     self.sceneReconstructor = nil
-                    self.busyMessage = nil
                     if case MultiImageReconstructor.ReconstructionError.cancelled = error {
-                        // User navigated back mid-run; stay silent.
+                        self.sceneProgress = nil
+                        if self.opened?.id == key { self.opened = nil }
                     } else {
                         self.errorMessage = "Scene reconstruction failed: \(error.localizedDescription)"
+                        self.sceneProgress = nil
                         if self.opened?.id == key { self.opened = nil }
                     }
                 }

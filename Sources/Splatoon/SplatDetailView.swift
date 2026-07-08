@@ -15,10 +15,10 @@ struct SplatDetailView: View {
     var body: some View {
         content
             .ignoresSafeArea()
-            .overlay { if let text = progressText { progressOverlay(text) } }
+            .overlay { if let info = progressInfo { progressOverlay(info) } }
             .overlay(alignment: .top) { toolbar }
-            .overlay(alignment: .bottom) { if progressText == nil { hint } }
-            .animation(.easeInOut(duration: 0.2), value: progressText)
+            .overlay(alignment: .bottom) { if progressInfo == nil && !isGeneratingScene { hint } }
+            .animation(.easeInOut(duration: 0.2), value: progressInfo)
             // Rebuild the mesh preview when entering mesh mode, changing the opened
             // splat, or tweaking mesh settings. `.task(id:)` cancels/reruns on change.
             .task(id: meshTaskID) {
@@ -36,7 +36,7 @@ struct SplatDetailView: View {
     private var content: some View {
         switch viewMode {
         case .splat:
-            SplatViewer(url: opened.url, onLoadingChange: { isLoading = $0 })
+            SplatViewer(url: opened.url, initialPose: opened.initialPose, onLoadingChange: { isLoading = $0 })
         case .mesh:
             if let mesh = model.openedMesh {
                 MeshViewer(mesh: mesh)
@@ -51,24 +51,43 @@ struct SplatDetailView: View {
         "\(viewMode.rawValue)|\(opened.id)|\(opened.url != nil)|\(settings.signature)"
     }
 
-    /// The progress message to show over the view, or nil when it's interactive.
-    private var progressText: String? {
-        if let busy = model.busyMessage { return busy }        // generating / building
-        if opened.url == nil { return "Generating splat…" }     // still inferring
+    private struct ProgressInfo: Equatable {
+        var text: String
+        var fraction: Double?   // nil = indeterminate
+    }
+
+    /// Whether the currently-opened scene is still reconstructing — the docked
+    /// bar (visible from anywhere, not just this screen) already shows its
+    /// progress, so the center overlay stays out of the way instead of
+    /// duplicating the same "stage (N%)" text.
+    private var isGeneratingScene: Bool {
+        opened.isScene && opened.url == nil && model.sceneProgress?.key == opened.id
+    }
+
+    /// The progress to show over the view, or nil when it's interactive (or
+    /// already shown in the docked bar — see `isGeneratingScene`).
+    private var progressInfo: ProgressInfo? {
+        if isGeneratingScene { return nil }
+        if let busy = model.busyMessage { return ProgressInfo(text: busy, fraction: nil) }
+        if opened.url == nil { return ProgressInfo(text: "Generating splat…", fraction: nil) }
         switch viewMode {
         case .splat:
-            return isLoading ? "Loading splat…" : nil
+            return isLoading ? ProgressInfo(text: "Loading splat…", fraction: nil) : nil
         case .mesh:
-            return model.openedMesh == nil ? "Building mesh…" : nil
+            return model.openedMesh == nil ? ProgressInfo(text: "Building mesh…", fraction: nil) : nil
         }
     }
 
-    private func progressOverlay(_ text: String) -> some View {
+    private func progressOverlay(_ info: ProgressInfo) -> some View {
         ZStack {
             Color.black.opacity(0.35).ignoresSafeArea()
             VStack(spacing: 14) {
-                ProgressView().controlSize(.large)
-                Text(text).foregroundStyle(.white)
+                if let fraction = info.fraction {
+                    ProgressView(value: fraction).frame(width: 220)
+                } else {
+                    ProgressView().controlSize(.large)
+                }
+                Text(info.text).foregroundStyle(.white)
             }
             .padding(28)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))

@@ -5,7 +5,11 @@ struct ContentView: View {
     @StateObject private var model = GalleryModel()
 
     var body: some View {
-        content
+        VStack(spacing: 0) {
+            content
+            SceneProgressBar(model: model)
+        }
+        .animation(.easeInOut(duration: 0.2), value: model.sceneProgress)
         .frame(minWidth: 860, minHeight: 600)
         .onAppear { model.onAppear() }
         .alert("Something went wrong",

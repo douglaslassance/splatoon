@@ -10,6 +10,9 @@ import SplatIO
 struct SplatViewer: NSViewRepresentable {
     /// The splat file to display. Changing this reloads the scene.
     var url: URL?
+    /// Where the camera starts (and returns to on R). nil = world origin, the
+    /// SHARP single-image convention (eye = the photo's own viewpoint).
+    var initialPose: ScenePose?
     /// Called on the main actor as the scene starts and finishes loading.
     var onLoadingChange: (Bool) -> Void = { _ in }
 
@@ -31,6 +34,7 @@ struct SplatViewer: NSViewRepresentable {
         view.delegate = context.coordinator
         context.coordinator.configure(view)
         context.coordinator.onLoadingChange = onLoadingChange
+        context.coordinator.initialPose = initialPose
         context.coordinator.load(url)
         // Take keyboard focus so WASD works once the view is in a window.
         DispatchQueue.main.async { [weak view] in
@@ -41,6 +45,7 @@ struct SplatViewer: NSViewRepresentable {
 
     func updateNSView(_ view: MTKView, context: Context) {
         context.coordinator.onLoadingChange = onLoadingChange
+        context.coordinator.initialPose = initialPose
         context.coordinator.load(url)
     }
 }
@@ -93,14 +98,18 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     private var renderer: SplatRenderer?
 
     var onLoadingChange: (Bool) -> Void = { _ in }
+    /// Where the camera starts (and returns to on R). nil = world origin, the
+    /// SHARP single-image convention (eye = the photo's own viewpoint).
+    var initialPose: ScenePose?
 
     private var loadedURL: URL?
     private var loadTask: Task<Void, Never>?
 
     private var drawableSize: CGSize = .zero
 
-    // Fly camera. Starts at the photo's viewpoint: at the origin, looking into
-    // the scene (-z after the OpenCV→OpenGL calibration below).
+    // Fly camera. Starts at `initialPose`, or at the origin looking into the
+    // scene (-z after the OpenCV→OpenGL calibration below) when nil — the
+    // photo's own viewpoint, for SHARP's single-image splats.
     private var eye = SIMD3<Float>(0, 0, 0)
     private var yaw: Float = 0     // radians, around world up (Y)
     private var pitch: Float = 0   // radians, around camera right (X)
@@ -155,9 +164,9 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     }
 
     private func resetCamera() {
-        eye = .zero
-        yaw = 0
-        pitch = 0
+        eye = initialPose?.eye ?? .zero
+        yaw = initialPose?.yaw ?? 0
+        pitch = initialPose?.pitch ?? 0
     }
 
     // MARK: - Camera basis
@@ -291,7 +300,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
 
 // MARK: - Matrix helpers (right-handed)
 
-private func rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
+func rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
     let a = normalize(axis)
     let ct = cosf(radians), st = sinf(radians), ci = 1 - ct
     let x = a.x, y = a.y, z = a.z
@@ -303,7 +312,7 @@ private func rotation(radians: Float, axis: SIMD3<Float>) -> matrix_float4x4 {
     ))
 }
 
-private func lookAtRightHand(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> matrix_float4x4 {
+func lookAtRightHand(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> matrix_float4x4 {
     let f = normalize(center - eye)
     let s = normalize(cross(f, up))
     let u = cross(s, f)
@@ -315,7 +324,7 @@ private func lookAtRightHand(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<
     ))
 }
 
-private func perspectiveRightHand(fovy: Float, aspect: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
+func perspectiveRightHand(fovy: Float, aspect: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
     let ys = 1 / tanf(fovy * 0.5)
     let xs = ys / aspect
     let zs = farZ / (nearZ - farZ)

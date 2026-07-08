@@ -42,6 +42,12 @@ final class MeshSettings: ObservableObject {
     @Published var useMultiImageReconstruction: Bool {
         didSet { defaults.set(useMultiImageReconstruction, forKey: Keys.useMultiImageReconstruction) }
     }
+    /// Training steps for the multi-image (COLMAP + OpenSplat) trainer. Too few
+    /// and densification never fires (see OpenSplat's warmup-length, 500 steps);
+    /// quality keeps improving well past 15000. Higher = longer wait.
+    @Published var multiImageIterations: Double {
+        didSet { defaults.set(multiImageIterations, forKey: Keys.multiImageIterations) }
+    }
     @Published var method: MeshMethod {
         didSet { defaults.set(method.rawValue, forKey: Keys.method) }
     }
@@ -71,6 +77,7 @@ final class MeshSettings: ObservableObject {
     private let defaults = UserDefaults.standard
     private enum Keys {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
+        static let multiImageIterations = "reconstruction.multiImageIterations"
         static let method = "mesh.method"
         static let smoothGrid = "mesh.smoothGrid"
         static let depthRatioCull = "mesh.depthRatioCull"
@@ -80,6 +87,7 @@ final class MeshSettings: ObservableObject {
 
     init() {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
+        multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         let raw = defaults.string(forKey: Keys.method) ?? MeshMethod.grid.rawValue
         method = MeshMethod(rawValue: raw) ?? .grid
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false
