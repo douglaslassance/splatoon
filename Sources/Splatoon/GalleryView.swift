@@ -50,6 +50,17 @@ struct ThumbnailCell: View {
                 }
             }
             .clipped()
+            .overlay(alignment: .topLeading) {
+                if asset.mediaType == .video {
+                    Image(systemName: "video.fill")
+                        .font(.caption)
+                        .foregroundStyle(.white)
+                        .padding(5)
+                        .background(.black.opacity(0.55), in: Circle())
+                        .padding(5)
+                        .help("Reconstruct a 3D splat from this video")
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if hasSplat {
                     Image(systemName: "cube.fill")

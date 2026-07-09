@@ -30,6 +30,7 @@ final class MultiImageReconstructor {
     enum ReconstructionError: LocalizedError {
         case toolFailed(tool: String, stage: String, code: Int32, log: String)
         case noSparseModel
+        case insufficientRegistration(registered: Int, total: Int)
         case noOutput
         case cancelled
 
@@ -38,7 +39,13 @@ final class MultiImageReconstructor {
             case .toolFailed(let tool, let stage, let code, let log):
                 return "\(tool) failed during \(stage) (exit \(code)).\n\(log)"
             case .noSparseModel:
-                return "COLMAP could not solve camera poses. The photos may lack enough overlap or texture."
+                return "COLMAP couldn't align the photos into a scene — they likely don't overlap enough, or "
+                    + "lack texture. Capture a slow, continuous orbit where each photo shares most of its view "
+                    + "with the next."
+            case .insufficientRegistration(let registered, let total):
+                return "Only \(registered) of \(total) photos could be aligned, too few for a good result. "
+                    + "The photos likely don't overlap enough — capture a slow, continuous orbit where each "
+                    + "photo shares most of its view with the next, rather than a few spread-out angles."
             case .noOutput:
                 return "The trainer produced no splat file."
             case .cancelled:
@@ -46,6 +53,9 @@ final class MultiImageReconstructor {
             }
         }
     }
+
+    /// One COLMAP sparse model and how many images it registered.
+    private struct SparseModel { let url: URL; let registered: Int }
 
     private let colmap: URL
     private let trainer: URL
@@ -56,6 +66,7 @@ final class MultiImageReconstructor {
     private let lock = NSLock()
     private var currentProcess: Process?
     private var cancelled = false
+    private var pidLockURL: URL?
 
     init(colmap: URL, trainer: URL) {
         self.colmap = colmap
@@ -82,6 +93,18 @@ final class MultiImageReconstructor {
     /// whole pipeline (dispatch to the UI is the caller's job).
     func run(imagesDir: URL, workDir: URL, output: URL, totalImages: Int,
             progress: @escaping (ReconstructionProgress) -> Void) throws {
+        // An orphaned subprocess from a previous run (app crashed, was
+        // force-quit, or updated mid-reconstruction) doesn't die with its
+        // parent on Unix — it keeps running and would race a fresh run over
+        // this exact scene's output file. Clear it before starting.
+        Self.killStaleProcess(for: output)
+        let lockURL = Self.pidLockURL(for: output)
+        self.pidLockURL = lockURL
+        defer {
+            self.pidLockURL = nil
+            try? FileManager.default.removeItem(at: lockURL)
+        }
+
         let fm = FileManager.default
         let databaseURL = workDir.appendingPathComponent("database.db")
         let sparseDir = workDir.appendingPathComponent("sparse", isDirectory: true)
@@ -138,24 +161,50 @@ final class MultiImageReconstructor {
             report(bands[1], within: n / total)
         }
 
-        // 3. Sparse reconstruction (camera poses + sparse points).
+        // 3. Sparse reconstruction (camera poses + sparse points). When the
+        // photos can't be connected, the mapper produces no model and exits
+        // nonzero — surface the friendly overlap guidance, not a raw COLMAP log.
         report(bands[2], within: 0)
-        try runTool(colmap, stage: "mapping", workDir: workDir, args: [
-            "mapper",
-            "--database_path", databaseURL.path,
-            "--image_path", imagesDir.path,
-            "--output_path", sparseDir.path,
-        ]) { line in
-            guard totalImages > 0, let caps = Self.captures(#"num_reg_frames=(\d+)"#, in: line),
-                  let n = Double(caps[0]) else { return }
-            report(bands[2], within: n / Double(totalImages))
+        do {
+            try runTool(colmap, stage: "mapping", workDir: workDir, args: [
+                "mapper",
+                "--database_path", databaseURL.path,
+                "--image_path", imagesDir.path,
+                "--output_path", sparseDir.path,
+            ]) { line in
+                guard totalImages > 0, let caps = Self.captures(#"num_reg_frames=(\d+)"#, in: line),
+                      let n = Double(caps[0]) else { return }
+                report(bands[2], within: n / Double(totalImages))
+            }
+        } catch ReconstructionError.toolFailed {
+            throw ReconstructionError.noSparseModel   // (cancellation still propagates)
         }
 
-        // COLMAP writes one model per subfolder (0, 1, …); model 0 is the largest.
-        let model0 = sparseDir.appendingPathComponent("0", isDirectory: true)
-        guard fm.fileExists(atPath: model0.appendingPathComponent("cameras.bin").path)
-                || fm.fileExists(atPath: model0.appendingPathComponent("cameras.txt").path) else {
+        // When COLMAP can't connect all the photos into one model, it fragments
+        // into several (sparse/0, sparse/1, …) — and `0` is NOT guaranteed to be
+        // the largest. Pick the model with the most registered images so we train
+        // on the best-connected subset, not a stray 2-image fragment.
+        let models = Self.sparseModels(in: sparseDir)
+        guard let best = models.max(by: { $0.registered < $1.registered }) else {
             throw ReconstructionError.noSparseModel
+        }
+
+        // Guard against the silent-garbage case: training on only a couple of
+        // views produces floater soup after a long wait. Fail fast, before the
+        // expensive training step, with capture guidance the user can act on.
+        let needed = max(3, Int(ceil(Double(totalImages) * 0.5)))
+        guard best.registered >= needed else {
+            throw ReconstructionError.insufficientRegistration(registered: best.registered, total: totalImages)
+        }
+
+        // OpenSplat reads the COLMAP project's sparse/0, so make the best model
+        // be sparse/0 (renaming the fragments out of the way if it isn't already).
+        let zero = sparseDir.appendingPathComponent("0", isDirectory: true)
+        if best.url.lastPathComponent != "0" {
+            let displaced = sparseDir.appendingPathComponent("0_replaced", isDirectory: true)
+            try? fm.removeItem(at: displaced)
+            if fm.fileExists(atPath: zero.path) { try? fm.moveItem(at: zero, to: displaced) }
+            try? fm.moveItem(at: best.url, to: zero)
         }
 
         // OpenSplat expects a COLMAP project laid out as <dir>/images and
@@ -193,6 +242,78 @@ final class MultiImageReconstructor {
     /// The registered camera poses OpenSplat trained against, scoped to `plyURL`.
     static func camerasURL(for plyURL: URL) -> URL {
         plyURL.deletingPathExtension().appendingPathExtension("cameras.json")
+    }
+
+    /// Every COLMAP sparse model under `sparseDir` (each numbered subfolder that
+    /// holds a reconstruction), with its registered-image count.
+    private static func sparseModels(in sparseDir: URL) -> [SparseModel] {
+        let fm = FileManager.default
+        let entries = (try? fm.contentsOfDirectory(at: sparseDir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        return entries.compactMap { url in
+            let hasModel = fm.fileExists(atPath: url.appendingPathComponent("images.bin").path)
+                || fm.fileExists(atPath: url.appendingPathComponent("images.txt").path)
+            guard hasModel else { return nil }
+            return SparseModel(url: url, registered: registeredImageCount(in: url))
+        }
+    }
+
+    /// How many images a COLMAP model registered. `images.bin` begins with a
+    /// little-endian UInt64 image count; fall back to the `# Number of images`
+    /// header if only the text form exists.
+    private static func registeredImageCount(in modelDir: URL) -> Int {
+        let binURL = modelDir.appendingPathComponent("images.bin")
+        if let handle = try? FileHandle(forReadingFrom: binURL) {
+            defer { try? handle.close() }
+            if let data = try? handle.read(upToCount: 8), data.count == 8 {
+                return Int(UInt64(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }))
+            }
+        }
+        if let text = try? String(contentsOf: modelDir.appendingPathComponent("images.txt"), encoding: .utf8),
+           let caps = captures(#"Number of images: (\d+)"#, in: text), let n = Int(caps[0]) {
+            return n
+        }
+        return 0
+    }
+
+    /// Where the currently-active subprocess's PID is recorded for this scene's
+    /// output, scoped exactly like `camerasURL(for:)`.
+    private static func pidLockURL(for output: URL) -> URL {
+        output.deletingPathExtension().appendingPathExtension("pid")
+    }
+
+    /// If a lock file exists for `output` and still names a live process, kill
+    /// it and remove the lock. Call before starting a fresh reconstruction for
+    /// the same scene, so an orphan from a previous run can't race a new one
+    /// over the same output file.
+    static func killStaleProcess(for output: URL) {
+        let lockURL = pidLockURL(for: output)
+        let fm = FileManager.default
+        defer { try? fm.removeItem(at: lockURL) }
+        guard let text = try? String(contentsOf: lockURL, encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
+        // Verify it's actually one of our tools before killing — PIDs get
+        // reused, so a stale number could coincidentally belong to something
+        // unrelated by the time we check.
+        guard isRunning(pid) else { return }
+        let command = commandLine(of: pid)
+        guard command.contains("opensplat") || command.contains("colmap") else { return }
+        kill(pid, SIGKILL)
+    }
+
+    private static func isRunning(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0
+    }
+
+    private static func commandLine(of pid: pid_t) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-o", "command=", "-p", String(pid)]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        guard (try? process.run()) != nil else { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     /// Reads the scene's first registered camera and converts it into
@@ -317,6 +438,11 @@ final class MultiImageReconstructor {
             pipe.fileHandleForReading.readabilityHandler = nil
             throw ReconstructionError.toolFailed(tool: executable.lastPathComponent, stage: stage,
                                                  code: -1, log: error.localizedDescription)
+        }
+        // Record the now-running subprocess's PID so a future run can detect
+        // and kill it if this one dies without cleaning up after itself.
+        if let pidLockURL {
+            try? String(process.processIdentifier).write(to: pidLockURL, atomically: true, encoding: .utf8)
         }
         process.waitUntilExit()
         drained.wait()   // let the handler finish draining/logging trailing output

@@ -2,6 +2,7 @@ import SwiftUI
 import Metal
 import MetalSplatter
 import SplatIO
+import AVFoundation
 import simd
 import CoreGraphics
 import ImageIO
@@ -20,6 +21,9 @@ struct SplatoonApp: App {
         }
         if CommandLine.arguments.contains("--selftest-scene") {
             runSceneSelfTest()
+        }
+        if CommandLine.arguments.contains("--selftest-video") {
+            runVideoSelfTest()
         }
         if CommandLine.arguments.contains("--selftest-render-image") {
             runRenderImageSelfTest()
@@ -106,6 +110,55 @@ private func runSceneSelfTest() -> Never {
         print("SELFTEST scene failed: \(error)")
         exit(1)
     }
+}
+
+/// Runs the video path headlessly: samples frames from a video FILE (the same
+/// `GalleryModel.extractFrames` the Photos path uses, just from an AVURLAsset)
+/// then reconstructs. Verifies frame extraction + dense-frame reconstruction
+/// without needing a Photos-library video.
+/// Usage: `Splatoon --selftest-video <videoFile> <out.ply> [iterations]`.
+private func runVideoSelfTest() -> Never {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: "--selftest-video"), args.count > idx + 2 else {
+        print("SELFTEST video: usage --selftest-video <videoFile> <out.ply> [iterations]")
+        exit(1)
+    }
+    let videoURL = URL(fileURLWithPath: args[idx + 1])
+    let out = URL(fileURLWithPath: args[idx + 2])
+    let iterations = (args.count > idx + 3 ? Int(args[idx + 3]) : nil) ?? 1000
+
+    guard let colmap = ToolLocator.resolvedURL(for: .colmap),
+          let trainer = ToolLocator.resolvedURL(for: .opensplat) else {
+        print("SELFTEST video: colmap/opensplat not found"); exit(1)
+    }
+
+    let workDir = FileManager.default.temporaryDirectory.appendingPathComponent("splatoon-selftest-video", isDirectory: true)
+    let framesDir = workDir.appendingPathComponent("frames", isDirectory: true)
+    try? FileManager.default.removeItem(at: workDir)
+    try? FileManager.default.createDirectory(at: framesDir, withIntermediateDirectories: true)
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var failure: String?
+    Task {
+        let frames = await GalleryModel.extractFrames(from: AVURLAsset(url: videoURL), to: framesDir) { done, total in
+            if done == total { print("SELFTEST video: extracted \(total) frames") }
+        }
+        guard frames >= 3 else { failure = "extracted only \(frames) frames"; semaphore.signal(); return }
+        let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
+        reconstructor.trainingIterations = iterations
+        do {
+            try reconstructor.run(imagesDir: framesDir, workDir: workDir, output: out, totalImages: frames) { update in
+                print("SELFTEST video: \(update.stageLabel) \(Int(update.fraction * 100))%")
+            }
+            print("SELFTEST video OK (\(frames) frames) -> \(out.path)")
+        } catch {
+            failure = "\(error)"
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if let failure { print("SELFTEST video failed: \(failure)"); exit(1) }
+    exit(0)
 }
 
 /// Offscreen-renders a splat PLY to a PNG using the real MetalSplatter renderer,

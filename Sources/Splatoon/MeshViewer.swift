@@ -14,6 +14,12 @@ struct MeshViewer: NSViewRepresentable {
     /// The triangle mesh to display. Rebuilt only when its size changes so an
     /// unrelated SwiftUI update doesn't reset the camera.
     var mesh: Mesh
+    /// Where the camera starts (and returns to on R). Identical to `SplatViewer`'s
+    /// pose: the mesh lives in the same flipped space `SplatViewer`'s calibration
+    /// (a π rotation about X) renders the splat into — and `MeshExport`'s `flip`
+    /// is that same rotation — so the pose transfers with no conversion. nil =
+    /// world origin, the SHARP single-image "eye = the photo" convention.
+    var initialPose: ScenePose?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -24,15 +30,16 @@ struct MeshViewer: NSViewRepresentable {
         view.antialiasingMode = .multisampling4X
         view.rendersContinuously = true       // keep animating for smooth WASD movement
         view.isPlaying = true
-        context.coordinator.install(mesh, in: view)
+        context.coordinator.install(mesh, initialPose: initialPose, in: view)
         // Take keyboard focus so WASD works once the view is in a window.
         DispatchQueue.main.async { [weak view] in view?.window?.makeFirstResponder(view) }
         return view
     }
 
     func updateNSView(_ view: FlyCameraSCNView, context: Context) {
-        guard Self.signature(of: mesh) != context.coordinator.signature else { return }
-        context.coordinator.install(mesh, in: view)
+        guard Self.signature(of: mesh) != context.coordinator.signature
+                || initialPose != context.coordinator.installedPose else { return }
+        context.coordinator.install(mesh, initialPose: initialPose, in: view)
     }
 
     static func dismantleNSView(_ view: FlyCameraSCNView, coordinator: Coordinator) {
@@ -107,6 +114,9 @@ struct MeshViewer: NSViewRepresentable {
 
         private weak var cameraNode: SCNNode?
         private var timer: Timer?
+        /// The pose the current scene was installed with, so `updateNSView` can
+        /// detect a pose change even when the mesh geometry is unchanged.
+        private(set) var installedPose: ScenePose?
 
         private var eye = SIMD3<Float>(0, 0, 0)
         private var yaw: Float = 0     // radians around world up (Y)
@@ -127,29 +137,37 @@ struct MeshViewer: NSViewRepresentable {
             static let q: UInt16 = 12, e: UInt16 = 14, r: UInt16 = 15
         }
 
-        func install(_ mesh: Mesh, in view: SCNView) {
+        func install(_ mesh: Mesh, initialPose: ScenePose?, in view: SCNView) {
             let scene = SCNScene()
             let node = SCNNode(geometry: MeshViewer.geometry(from: mesh))
             scene.rootNode.addChildNode(node)
 
             let (center, radius) = MeshViewer.bounds(of: mesh.positions)
+
+            // Start at the same viewpoint the splat opens from — the photo's own
+            // camera — rather than a generic bounding-box angle, so toggling
+            // Splat↔Mesh keeps the framing steady. nil = world origin (SHARP);
+            // a registered camera pose for scenes.
+            if let initialPose {
+                eye = initialPose.eye; yaw = initialPose.yaw; pitch = initialPose.pitch
+            } else {
+                eye = .zero; yaw = 0; pitch = 0
+            }
+            home = (eye, yaw, pitch)
+
+            // Near/far and navigation speed still scale to the mesh's size, framed
+            // from wherever the eye is (which may sit inside or beside the mesh).
             let camera = SCNCamera()
             camera.fieldOfView = CGFloat(fovDegrees)
             camera.projectionDirection = .vertical
-            camera.zNear = Double(max(0.001, radius * 0.01))
-            camera.zFar = Double(radius * 40 + 10)
+            let eyeToFar = simd_length(center - eye) + radius
+            camera.zNear = Double(max(0.001, radius * 0.002))
+            camera.zFar = Double(eyeToFar * 2 + 1)
             let camNode = SCNNode()
             camNode.camera = camera
             scene.rootNode.addChildNode(camNode)
             cameraNode = camNode
 
-            // Frame the mesh: back off along +Z looking -Z at its centre. Speeds
-            // scale with the mesh so navigation feels the same at any size.
-            let dist = radius / max(tan(fovDegrees * .pi / 180 / 2), 1e-3) * 1.3
-            eye = center + SIMD3(0, 0, dist)
-            yaw = 0
-            pitch = 0
-            home = (eye, 0, 0)
             moveSpeed = radius * 1.5
             dollyScale = radius * 0.01
             panSensitivity = moveSpeed * 0.002
@@ -158,6 +176,7 @@ struct MeshViewer: NSViewRepresentable {
             view.scene = scene
             view.pointOfView = camNode
             signature = MeshViewer.signature(of: mesh)
+            installedPose = initialPose
             startTimer()
         }
 

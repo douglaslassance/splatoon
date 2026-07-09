@@ -4,6 +4,7 @@ import Photos
 import ImageIO
 import CoreImage
 import CoreGraphics
+import AVFoundation
 import UniformTypeIdentifiers
 
 /// Drives the Photos-library gallery: authorization, asset listing, thumbnail
@@ -22,16 +23,18 @@ final class GalleryModel: ObservableObject {
         var initialPose: ScenePose?
     }
 
-    /// Live status of a background multi-image reconstruction, independent of
-    /// `opened`/navigation — it keeps running (and this keeps updating) even
-    /// after the user backs out to the gallery, so a docked progress bar can
-    /// show it regardless of what's currently on screen.
+    /// Live status of an in-progress splat generation — single-image (SHARP) or
+    /// multi-image (COLMAP + OpenSplat) — surfaced in the docked progress bar so
+    /// both share the same UI. Independent of `opened`/navigation, so a
+    /// long-running scene keeps updating even after the user backs to the gallery.
     struct SceneProgress: Equatable {
         var key: String
         var title: String
         var stageLabel: String
         var fraction: Double     // 0...1 across the whole pipeline
         var isComplete = false
+        var isScene = true       // scenes reopen at a registered camera pose; SHARP doesn't
+        var cancellable = true   // multi-image can be cancelled; SHARP is too fast to bother
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -88,7 +91,8 @@ final class GalleryModel: ObservableObject {
     private func fetchAssets() {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+        options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
+                                        PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
         let result = PHAsset.fetchAssets(with: options)
         var collected: [PHAsset] = []
         collected.reserveCapacity(result.count)
@@ -118,14 +122,23 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Open / generate
 
-    /// Open a photo. When `allowMultiImage` is true (the default; gated by the
-    /// "Reconstruct multi-image scenes" setting) and the photo has enough
-    /// same-place/time siblings, they're reconstructed together as one
-    /// multi-view scene, trained for `multiImageIterations` steps. Otherwise
-    /// this photo alone goes through single-image SHARP.
+    /// Open an asset. A **video** is reconstructed as a multi-view scene from
+    /// frames sampled across it (dense, overlapping frames are ideal SfM input).
+    /// A **photo** with enough same-place/time siblings likewise reconstructs as
+    /// a scene; a lone photo goes through single-image SHARP. Scenes are gated by
+    /// `allowMultiImage` (the "Reconstruct multi-image scenes" setting).
     func open(_ asset: PHAsset, allowMultiImage: Bool = true, multiImageIterations: Int = 15000) {
         errorMessage = nil
         resetOpenedMesh()
+
+        if asset.mediaType == .video {
+            guard allowMultiImage else {
+                errorMessage = "Turn on “Reconstruct multi-image scenes” in Settings (⌘,) to build a splat from a video."
+                return
+            }
+            openVideoScene(asset, iterations: multiImageIterations)
+            return
+        }
 
         if allowMultiImage {
             let group = SceneGrouping.neighbors(of: asset, in: assets)
@@ -149,10 +162,11 @@ final class GalleryModel: ObservableObject {
             return
         }
 
-        // Switch to the splat view immediately (url nil = still generating) so
-        // progress is shown there rather than over the gallery.
+        // Switch to the splat view immediately (url nil = still generating);
+        // progress shows in the docked bar, same as multi-image scenes.
         opened = OpenedSplat(id: identifier, title: title, url: nil)
-        busyMessage = "Loading photo…"
+        sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Loading photo…",
+                                      fraction: 0.05, isScene: false, cancellable: false)
         let requestOptions = PHImageRequestOptions()
         requestOptions.isNetworkAccessAllowed = true
         requestOptions.deliveryMode = .highQualityFormat
@@ -162,9 +176,7 @@ final class GalleryModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 guard let data, let cgImage = Self.decodeOriented(data) else {
-                    self.busyMessage = nil
-                    self.errorMessage = "Could not load that photo."
-                    if self.opened?.id == identifier { self.opened = nil }
+                    self.failGeneration(key: identifier, message: "Could not load that photo.")
                     return
                 }
                 self.generate(cgImage: cgImage,
@@ -181,7 +193,10 @@ final class GalleryModel: ObservableObject {
                           title: String,
                           modelURL: URL,
                           destination: URL) {
-        busyMessage = "Loading model…"
+        // SHARP has no fine-grained progress (Core ML inference is one opaque
+        // call), so the fractions are coarse stage markers — but the shared bar
+        // still gives named stages instead of a bare spinner.
+        updateGenerationStage(key: identifier, "Loading model…", 0.15)
         let decimation = self.decimation
         let existingRunner = (cachedRunnerURL == modelURL) ? cachedRunner : nil
 
@@ -191,14 +206,14 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     self.cachedRunner = runner
                     self.cachedRunnerURL = modelURL
-                    self.busyMessage = "Preparing image…"
+                    self.updateGenerationStage(key: identifier, "Preparing image…", 0.35)
                 }
                 let input = try runner.preprocess(cgImage)
 
-                await MainActor.run { self.busyMessage = "Running inference…" }
+                await MainActor.run { self.updateGenerationStage(key: identifier, "Running inference…", 0.6) }
                 let gaussians = try runner.predict(image: input, focalLengthPx: 1536)
 
-                await MainActor.run { self.busyMessage = "Writing splat…" }
+                await MainActor.run { self.updateGenerationStage(key: identifier, "Writing splat…", 0.9) }
                 try SplatExporter.savePLY(
                     gaussians: gaussians,
                     focalLengthPx: 1536,
@@ -209,21 +224,41 @@ final class GalleryModel: ObservableObject {
 
                 await MainActor.run {
                     self.splatIdentifiers.insert(identifier)
-                    self.busyMessage = nil
                     // Only reveal the splat if the user is still on this one
                     // (they may have navigated back during generation).
                     if self.opened?.id == identifier {
                         self.opened = OpenedSplat(id: identifier, title: title, url: destination)
                     }
+                    self.completeGeneration(key: identifier, title: title, isScene: false)
                 }
             } catch {
                 await MainActor.run {
-                    self.busyMessage = nil
-                    self.errorMessage = "Generation failed: \(error.localizedDescription)"
-                    if self.opened?.id == identifier { self.opened = nil }
+                    self.failGeneration(key: identifier, message: "Generation failed: \(error.localizedDescription)")
                 }
             }
         }
+    }
+
+    // MARK: - Generation progress (shared by single- and multi-image)
+
+    private func updateGenerationStage(key: String, _ stage: String, _ fraction: Double) {
+        guard sceneProgress?.key == key else { return }
+        sceneProgress?.stageLabel = stage
+        sceneProgress?.fraction = fraction
+    }
+
+    /// Finish a generation: reveal a brief "Ready" state in the docked bar (which
+    /// auto-dismisses, and lets a user who wandered off tap back in).
+    private func completeGeneration(key: String, title: String, isScene: Bool) {
+        guard sceneProgress?.key == key else { return }
+        sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Ready", fraction: 1,
+                                      isComplete: true, isScene: isScene, cancellable: false)
+    }
+
+    private func failGeneration(key: String, message: String) {
+        if sceneProgress?.key == key { sceneProgress = nil }
+        errorMessage = message
+        if opened?.id == key { opened = nil }
     }
 
     /// Navigate back to the gallery. Any in-flight scene reconstruction keeps
@@ -247,10 +282,10 @@ final class GalleryModel: ObservableObject {
         guard let progress = sceneProgress else { return }
         let destination = splatURL(for: progress.key)
         if FileManager.default.fileExists(atPath: destination.path) {
-            opened = OpenedSplat(id: progress.key, title: progress.title, url: destination, isScene: true,
-                                 initialPose: MultiImageReconstructor.initialPose(for: destination))
+            opened = OpenedSplat(id: progress.key, title: progress.title, url: destination, isScene: progress.isScene,
+                                 initialPose: progress.isScene ? MultiImageReconstructor.initialPose(for: destination) : nil)
         } else {
-            opened = OpenedSplat(id: progress.key, title: progress.title, url: nil, isScene: true)
+            opened = OpenedSplat(id: progress.key, title: progress.title, url: nil, isScene: progress.isScene)
         }
     }
 
@@ -261,18 +296,45 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Multi-image scene reconstruction
 
-    /// Reconstruct a splat from several photos of the same scene (COLMAP +
-    /// OpenSplat), caching the result like a single-image splat. Runs to
-    /// completion in the background regardless of navigation; `sceneProgress`
-    /// tracks it independently of `opened` so a docked bar can show it from
-    /// anywhere in the app.
+    /// Reconstruct a splat from several photos of the same scene, caching the
+    /// result like a single-image splat.
     private func openScene(_ group: [PHAsset], iterations: Int) {
         // Iteration count is part of the cache key so raising it in Settings and
         // reopening actually retrains, instead of silently reusing a blurrier cache.
         let key = SceneGrouping.sceneKey(for: group) + "-i\(iterations)"
-        let destination = splatURL(for: key)
-        let title = "Scene · \(group.count) photos"
+        startSceneReconstruction(key: key, title: "Scene · \(group.count) photos", iterations: iterations) { imagesDir, report in
+            var written = 0
+            for (index, asset) in group.enumerated() {
+                if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
+                report("Preparing \(group.count) photos…", Double(index + 1) / Double(group.count))
+            }
+            return written
+        }
+    }
 
+    /// Reconstruct a splat from a single video, sampling frames across it — dense,
+    /// overlapping frames are ideal SfM input, sidestepping the sparse-photo
+    /// registration failures.
+    private func openVideoScene(_ asset: PHAsset, iterations: Int) {
+        let key = "video-" + SceneGrouping.stableHash(asset.localIdentifier) + "-i\(iterations)"
+        startSceneReconstruction(key: key, title: "Video scene", iterations: iterations) { imagesDir, report in
+            await self.extractVideoFrames(from: asset, to: imagesDir) { done, total in
+                report("Extracting \(total) frames…", Double(done) / Double(max(total, 1)))
+            }
+        }
+    }
+
+    /// Shared reconstruction driver used by both photo-group and video scenes.
+    /// `prepare` populates `imagesDir` with COLMAP-ready images and returns how
+    /// many it wrote, reporting its own 0…1 sub-progress via `report`. Everything
+    /// else — tool resolution, the COLMAP+OpenSplat run, progress, caching, and
+    /// error handling — is identical. Runs in the background regardless of
+    /// navigation; `sceneProgress` tracks it independently of `opened`.
+    private func startSceneReconstruction(
+        key: String, title: String, iterations: Int,
+        prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
+    ) {
+        let destination = splatURL(for: key)
         if FileManager.default.fileExists(atPath: destination.path) {
             opened = OpenedSplat(id: key, title: title, url: destination, isScene: true,
                                  initialPose: MultiImageReconstructor.initialPose(for: destination))
@@ -293,13 +355,11 @@ final class GalleryModel: ObservableObject {
         }
 
         opened = OpenedSplat(id: key, title: title, url: nil, isScene: true)
-        sceneProgress = SceneProgress(key: key, title: title,
-                                      stageLabel: "Found \(group.count) related photos…", fraction: 0)
+        sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Preparing…", fraction: 0)
 
         let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
         reconstructor.trainingIterations = iterations
         sceneReconstructor = reconstructor
-        let assets = group
 
         Task.detached(priority: .userInitiated) {
             let fm = FileManager.default
@@ -309,24 +369,21 @@ final class GalleryModel: ObservableObject {
             try? fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
 
             do {
-                // Preparing photos: the first 5% of the overall bar.
-                var written = 0
-                for (index, asset) in assets.enumerated() {
-                    if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
-                    let fraction = Double(index + 1) / Double(assets.count) * 0.05
-                    await MainActor.run {
+                // Preparing images occupies the first 5% of the overall bar.
+                let written = await prepare(imagesDir) { label, fraction in
+                    Task { @MainActor in
                         guard self.sceneProgress?.key == key else { return }
-                        self.sceneProgress?.stageLabel = "Preparing \(assets.count) photos…"
-                        self.sceneProgress?.fraction = fraction
+                        self.sceneProgress?.stageLabel = label
+                        self.sceneProgress?.fraction = max(0, min(1, fraction)) * 0.05
                     }
                 }
-                guard written >= SceneGrouping.minSceneSize else {
+                guard written >= 3 else {   // COLMAP needs at least 3 views
                     throw MultiImageReconstructor.ReconstructionError.noSparseModel
                 }
 
                 // COLMAP + training: the remaining 95%.
                 try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination,
-                                      totalImages: assets.count) { update in
+                                      totalImages: written) { update in
                     Task { @MainActor in
                         guard self.sceneProgress?.key == key else { return }
                         self.sceneProgress?.stageLabel = update.stageLabel
@@ -352,17 +409,63 @@ final class GalleryModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.sceneReconstructor = nil
+                    self.sceneProgress = nil
                     if case MultiImageReconstructor.ReconstructionError.cancelled = error {
-                        self.sceneProgress = nil
                         if self.opened?.id == key { self.opened = nil }
                     } else {
                         self.errorMessage = "Scene reconstruction failed: \(error.localizedDescription)"
-                        self.sceneProgress = nil
                         if self.opened?.id == key { self.opened = nil }
                     }
                 }
             }
         }
+    }
+
+    /// Resolve the Photos video to an AVAsset and sample frames from it (see
+    /// `extractFrames`).
+    private func extractVideoFrames(from asset: PHAsset, to dir: URL,
+                                    progress: @escaping (Int, Int) -> Void) async -> Int {
+        let avAsset: AVAsset? = await withCheckedContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+                continuation.resume(returning: avAsset)
+            }
+        }
+        guard let avAsset else { return 0 }
+        return await Self.extractFrames(from: avAsset, to: dir, progress: progress)
+    }
+
+    /// Sample evenly-spaced frames from a video into `dir` as JPEGs (orientation
+    /// baked in, downscaled for speed). ~3 fps, clamped 15…48 frames — dense
+    /// enough to register reliably without O(n²) matching exploding. Returns the
+    /// count written; `progress(done, total)` reports extraction progress.
+    /// `nonisolated static` so the headless `--selftest-video` hook can drive the
+    /// exact same sampling from a file URL, without PhotoKit.
+    nonisolated static func extractFrames(from avAsset: AVAsset, to dir: URL,
+                                          progress: @escaping (Int, Int) -> Void) async -> Int {
+        guard let duration = try? await avAsset.load(.duration) else { return 0 }
+        let seconds = CMTimeGetSeconds(duration)
+        guard seconds.isFinite, seconds > 0 else { return 0 }
+
+        let count = min(48, max(15, Int(seconds * 3)))
+        let generator = AVAssetImageGenerator(asset: avAsset)
+        generator.appliesPreferredTrackTransform = true            // bake in orientation
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        generator.maximumSize = CGSize(width: 1920, height: 1920)  // downscale for speed
+
+        var written = 0
+        for i in 0..<count {
+            let t = seconds * (Double(i) + 0.5) / Double(count)
+            if let cgImage = try? await generator.image(at: CMTime(seconds: t, preferredTimescale: 600)).image {
+                let url = dir.appendingPathComponent(String(format: "frame_%04d.jpg", i))
+                if Self.writeJPEG(cgImage, to: url) { written += 1 }
+            }
+            progress(i + 1, count)
+        }
+        return written
     }
 
     /// Export one Photos asset to a JPEG in `dir`, orientation baked in so COLMAP
@@ -437,6 +540,20 @@ final class GalleryModel: ObservableObject {
                     self.errorMessage = "Mesh build failed: \(error.localizedDescription)"
                 }
             }
+        }
+    }
+
+    // MARK: - Cleanup hand-off
+
+    /// Hand the current splat to SuperSplat — PlayCanvas's free, browser-based
+    /// splat editor — for cleanup (floater removal, cropping) and publishing. It
+    /// processes splats client-side and can't auto-load a local file, so reveal
+    /// the cached `.ply` in Finder and open the editor; the user drags it in.
+    func openInSuperSplat() {
+        guard let opened, let source = opened.url else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([source])
+        if let url = URL(string: "https://superspl.at/editor") {
+            NSWorkspace.shared.open(url)
         }
     }
 

@@ -61,7 +61,7 @@ struct SceneProgressBar: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-            } else {
+            } else if progress.cancellable {
                 Button("Cancel") {
                     model.cancelSceneReconstruction()
                 }

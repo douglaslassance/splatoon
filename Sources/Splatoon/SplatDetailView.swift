@@ -17,7 +17,7 @@ struct SplatDetailView: View {
             .ignoresSafeArea()
             .overlay { if let info = progressInfo { progressOverlay(info) } }
             .overlay(alignment: .top) { toolbar }
-            .overlay(alignment: .bottom) { if progressInfo == nil && !isGeneratingScene { hint } }
+            .overlay(alignment: .bottom) { if progressInfo == nil && !isGenerating { hint } }
             .animation(.easeInOut(duration: 0.2), value: progressInfo)
             // Rebuild the mesh preview when entering mesh mode, changing the opened
             // splat, or tweaking mesh settings. `.task(id:)` cancels/reruns on change.
@@ -39,7 +39,7 @@ struct SplatDetailView: View {
             SplatViewer(url: opened.url, initialPose: opened.initialPose, onLoadingChange: { isLoading = $0 })
         case .mesh:
             if let mesh = model.openedMesh {
-                MeshViewer(mesh: mesh)
+                MeshViewer(mesh: mesh, initialPose: opened.initialPose)
             } else {
                 Color.clear   // progress overlay covers the build
             }
@@ -56,18 +56,18 @@ struct SplatDetailView: View {
         var fraction: Double?   // nil = indeterminate
     }
 
-    /// Whether the currently-opened scene is still reconstructing — the docked
-    /// bar (visible from anywhere, not just this screen) already shows its
-    /// progress, so the center overlay stays out of the way instead of
-    /// duplicating the same "stage (N%)" text.
-    private var isGeneratingScene: Bool {
-        opened.isScene && opened.url == nil && model.sceneProgress?.key == opened.id
+    /// Whether the opened splat (single- or multi-image) is still generating —
+    /// the docked bar (visible from anywhere, not just this screen) already shows
+    /// its staged progress, so the center overlay stays out of the way instead of
+    /// duplicating it.
+    private var isGenerating: Bool {
+        opened.url == nil && model.sceneProgress?.key == opened.id
     }
 
     /// The progress to show over the view, or nil when it's interactive (or
-    /// already shown in the docked bar — see `isGeneratingScene`).
+    /// already shown in the docked bar — see `isGenerating`).
     private var progressInfo: ProgressInfo? {
-        if isGeneratingScene { return nil }
+        if isGenerating { return nil }
         if let busy = model.busyMessage { return ProgressInfo(text: busy, fraction: nil) }
         if opened.url == nil { return ProgressInfo(text: "Generating splat…", fraction: nil) }
         switch viewMode {
@@ -119,6 +119,15 @@ struct SplatDetailView: View {
             .labelsHidden()
 
             Spacer()
+
+            Button {
+                model.openInSuperSplat()
+            } label: {
+                Label("Clean Up", systemImage: "wand.and.stars")
+            }
+            .help("Open this splat in SuperSplat (free browser editor) to remove floaters, crop, and publish. "
+                  + "The file is revealed in Finder — drag it into the editor tab.")
+            .disabled(opened.url == nil)
 
             Button {
                 export()

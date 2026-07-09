@@ -24,6 +24,8 @@ enum SceneGrouping {
 
         var group: [PHAsset] = []
         for candidate in assets {
+            // Photo grouping is image-only; a video is its own multi-view scene.
+            guard candidate.mediaType == .image else { continue }
             if candidate.localIdentifier == asset.localIdentifier {
                 group.append(candidate)
                 continue
@@ -53,12 +55,18 @@ enum SceneGrouping {
     /// A stable cache key for a scene, independent of member order and stable
     /// across launches (a deterministic FNV-1a hash, unlike `String.hashValue`).
     static func sceneKey(for group: [PHAsset]) -> String {
-        let joined = group.map(\.localIdentifier).sorted().joined(separator: "|")
+        "scene-" + stableHash(group.map(\.localIdentifier).sorted().joined(separator: "|"))
+    }
+
+    /// Deterministic FNV-1a hash of a string, stable across launches. Used for
+    /// cache keys (scenes, videos) that must survive relaunches, unlike
+    /// `String.hashValue` which is per-process seeded.
+    static func stableHash(_ string: String) -> String {
         var hash: UInt64 = 0xcbf29ce484222325
-        for byte in joined.utf8 {
+        for byte in string.utf8 {
             hash ^= UInt64(byte)
             hash = hash &* 0x100000001b3
         }
-        return "scene-" + String(hash, radix: 16)
+        return String(hash, radix: 16)
     }
 }

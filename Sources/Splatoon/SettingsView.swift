@@ -37,6 +37,17 @@ struct SettingsView: View {
                               + "estimate (~13 steps/sec) — actual speed depends on your Mac.")
                     .disabled(!settings.useMultiImageReconstruction)
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
+                Label {
+                    Text("For best results, capture a **slow continuous orbit**: keep the subject "
+                         + "framed and take many overlapping photos, each stepping only slightly from "
+                         + "the last. A few photos from spread-out angles won't align — the aligner "
+                         + "needs consecutive shots to share most of their view.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "camera.on.rectangle").foregroundStyle(.secondary)
+                }
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(6)
