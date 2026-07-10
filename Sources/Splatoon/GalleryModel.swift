@@ -41,6 +41,7 @@ final class GalleryModel: ObservableObject {
         var isComplete = false
         var isScene = true       // scenes reopen at a registered camera pose; SHARP doesn't
         var cancellable = true   // multi-image can be cancelled; SHARP is too fast to bother
+        var indeterminate = false // no measurable fraction (splat load, mesh build)
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -57,7 +58,6 @@ final class GalleryModel: ObservableObject {
     }
 
     @Published var opened: OpenedSplat?
-    @Published private(set) var busyMessage: String?
     @Published private(set) var sceneProgress: SceneProgress?
     @Published var sceneFailure: SceneFailure?
     @Published var errorMessage: String?
@@ -70,6 +70,10 @@ final class GalleryModel: ObservableObject {
 
     /// Fraction of Gaussians to keep (1.0 = all).
     var decimation: Float = 1.0
+
+    /// The source asset (tapped photo / video) each opened splat was built from,
+    /// keyed by the splat's cache id — so it can be regenerated on demand.
+    private var sourceForOpened: [String: PHAsset] = [:]
 
     let imageManager = PHCachingImageManager()
 
@@ -167,6 +171,7 @@ final class GalleryModel: ObservableObject {
         let identifier = asset.localIdentifier
         let destination = splatURL(for: identifier)
         let title = Self.title(for: asset)
+        sourceForOpened[identifier] = asset
 
         if FileManager.default.fileExists(atPath: destination.path) {
             opened = OpenedSplat(id: identifier, title: title, url: destination)
@@ -283,6 +288,28 @@ final class GalleryModel: ObservableObject {
     func closeOpened() {
         opened = nil
         resetOpenedMesh()
+        clearIndeterminate()   // drop a stray "Loading splat…"/"Building mesh…" bar
+    }
+
+    /// Discard the opened splat's cached files and rebuild it from the original
+    /// source (photo, photo group, or video). Uses the current settings.
+    func regenerateOpened(iterations: Int) {
+        guard let opened, let asset = sourceForOpened[opened.id] else { return }
+        let wasScene = opened.isScene
+
+        let ply = splatURL(for: opened.id)
+        try? FileManager.default.removeItem(at: ply)
+        try? FileManager.default.removeItem(at: MultiImageReconstructor.camerasURL(for: ply))
+        splatIdentifiers.remove(opened.id)
+        sourceForOpened[opened.id] = nil
+        resetOpenedMesh()
+        self.opened = nil
+
+        if asset.mediaType == .video && !wasScene {
+            openVideoSingleFrame(asset)                                   // the video's SHARP fallback
+        } else {
+            open(asset, allowMultiImage: wasScene, multiImageIterations: iterations)
+        }
     }
 
     /// Stop the in-flight reconstruction, if any (the docked progress bar's
@@ -318,6 +345,7 @@ final class GalleryModel: ObservableObject {
         // Iteration count is part of the cache key so raising it in Settings and
         // reopening actually retrains, instead of silently reusing a blurrier cache.
         let key = SceneGrouping.sceneKey(for: group) + "-i\(iterations)"
+        sourceForOpened[key] = hero
         startSceneReconstruction(key: key, title: "Scene · \(group.count) photos",
                                  iterations: iterations, hero: hero) { imagesDir, report in
             var written = 0
@@ -334,6 +362,7 @@ final class GalleryModel: ObservableObject {
     /// registration failures.
     private func openVideoScene(_ asset: PHAsset, iterations: Int) {
         let key = "video-" + SceneGrouping.stableHash(asset.localIdentifier) + "-i\(iterations)"
+        sourceForOpened[key] = asset
         startSceneReconstruction(key: key, title: "Video scene", iterations: iterations, hero: asset) { imagesDir, report in
             await self.extractVideoFrames(from: asset, to: imagesDir) { done, total in
                 report("Extracting \(total) frames…", Double(done) / Double(max(total, 1)))
@@ -360,6 +389,7 @@ final class GalleryModel: ObservableObject {
         let identifier = asset.localIdentifier
         let destination = splatURL(for: identifier)
         let title = Self.title(for: asset)
+        sourceForOpened[identifier] = asset
 
         if FileManager.default.fileExists(atPath: destination.path) {
             opened = OpenedSplat(id: identifier, title: title, url: destination)
@@ -598,7 +628,7 @@ final class GalleryModel: ObservableObject {
 
         openedMesh = nil
         openedMeshKey = key
-        busyMessage = "Building mesh…"
+        setIndeterminate("Building mesh…")
         Task.detached(priority: .userInitiated) {
             do {
                 let gaussians = try SplatPLYReader.readGaussians(from: source)
@@ -608,29 +638,63 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }  // superseded meanwhile
                     self.openedMesh = mesh
-                    self.busyMessage = nil
+                    self.clearIndeterminate()
                 }
             } catch {
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }
-                    self.busyMessage = nil
+                    self.clearIndeterminate()
                     self.errorMessage = "Mesh build failed: \(error.localizedDescription)"
                 }
             }
         }
     }
 
+    // MARK: - Indeterminate progress (splat load, mesh build) — routed through
+    // the same docked bar as generation, so nothing shows a center overlay.
+
+    /// Show an indeterminate stage in the docked bar for the opened splat. Won't
+    /// override an in-flight generation/reconstruction (which owns the bar with a
+    /// real fraction).
+    private func setIndeterminate(_ stage: String) {
+        guard let opened else { return }
+        if let p = sceneProgress, p.key == opened.id, !p.indeterminate, !p.isComplete { return }
+        sceneProgress = SceneProgress(key: opened.id, title: opened.title, stageLabel: stage,
+                                      fraction: 0, isScene: opened.isScene, cancellable: false, indeterminate: true)
+    }
+
+    /// Clear an indeterminate stage (leaves determinate/complete progress alone).
+    private func clearIndeterminate() {
+        if sceneProgress?.indeterminate == true { sceneProgress = nil }
+    }
+
+    /// Splat loading (MetalSplatter reading the PLY). Only when a real splat is
+    /// open — never during reconstruction (url is nil then).
+    func setSplatLoading(_ loading: Bool) {
+        guard let opened, opened.url != nil else { return }
+        if loading { setIndeterminate("Loading splat…") } else { clearIndeterminate() }
+    }
+
     // MARK: - Cleanup hand-off
 
     /// Hand the current splat to SuperSplat — PlayCanvas's free, browser-based
-    /// splat editor — for cleanup (floater removal, cropping) and publishing. It
-    /// processes splats client-side and can't auto-load a local file, so reveal
-    /// the cached `.ply` in Finder and open the editor; the user drags it in.
+    /// splat editor — for cleanup (floater removal, cropping) and publishing.
+    /// Serve the local `.ply` over a loopback HTTP server and pass it to
+    /// SuperSplat's `?load=<url>` so it opens *with the splat already loaded*,
+    /// instead of relying on a manual drag. Falls back to revealing the file if
+    /// the server can't start.
     func openInSuperSplat() {
         guard let opened, let source = opened.url else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([source])
-        if let url = URL(string: "https://superspl.at/editor") {
-            NSWorkspace.shared.open(url)
+        Task { @MainActor in
+            guard let served = await LocalFileServer.shared.servedURL(for: source),
+                  var components = URLComponents(string: "https://superspl.at/editor") else {
+                // Fallback: reveal the file so the user can drag it into the editor.
+                NSWorkspace.shared.activateFileViewerSelecting([source])
+                if let url = URL(string: "https://superspl.at/editor") { NSWorkspace.shared.open(url) }
+                return
+            }
+            components.queryItems = [URLQueryItem(name: "load", value: served.absoluteString)]
+            if let url = components.url { NSWorkspace.shared.open(url) }
         }
     }
 
@@ -668,7 +732,7 @@ final class GalleryModel: ObservableObject {
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
         let method = Self.effectiveMethod(method, isScene: opened.isScene)
-        busyMessage = "Building mesh…"
+        setIndeterminate("Exporting mesh…")
         Task.detached(priority: .userInitiated) {
             do {
                 let gaussians = try SplatPLYReader.readGaussians(from: source)
@@ -676,10 +740,10 @@ final class GalleryModel: ObservableObject {
                                          method: method, smoothGrid: smoothGrid,
                                          depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
                                          poissonResolution: poissonResolution)
-                await MainActor.run { self.busyMessage = nil }
+                await MainActor.run { self.clearIndeterminate() }
             } catch {
                 await MainActor.run {
-                    self.busyMessage = nil
+                    self.clearIndeterminate()
                     self.errorMessage = "Mesh export failed: \(error.localizedDescription)"
                 }
             }

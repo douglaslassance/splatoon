@@ -43,14 +43,16 @@ struct SceneProgressBar: View {
             }
             .frame(minWidth: 160, alignment: .leading)
 
-            if !progress.isComplete {
+            if progress.isComplete {
+                Spacer(minLength: 0)
+            } else if progress.indeterminate {
+                ProgressView().progressViewStyle(.linear)   // no measurable fraction
+            } else {
                 ProgressView(value: progress.fraction)
                 Text("\(Int(progress.fraction * 100))%")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 36, alignment: .trailing)
-            } else {
-                Spacer(minLength: 0)
             }
 
             if progress.isComplete {

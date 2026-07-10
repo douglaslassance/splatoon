@@ -126,7 +126,7 @@ struct MeshViewer: NSViewRepresentable {
         private var pressedKeys = Set<UInt16>()
         private var lastFrameTime: CFTimeInterval?
 
-        private let fovDegrees: Float = 65
+        private var fovDegrees: Float = sharpFOVyDegrees   // set per-pose in install()
         private let lookSensitivity: Float = 0.005
         private var moveSpeed: Float = 8        // world units/sec, scaled to mesh size
         private var dollyScale: Float = 0.05    // per scroll unit, scaled to mesh size
@@ -150,8 +150,10 @@ struct MeshViewer: NSViewRepresentable {
             // a registered camera pose for scenes.
             if let initialPose {
                 eye = initialPose.eye; yaw = initialPose.yaw; pitch = initialPose.pitch
+                fovDegrees = initialPose.fovyDegrees
             } else {
                 eye = .zero; yaw = 0; pitch = 0
+                fovDegrees = sharpFOVyDegrees
             }
             home = (eye, yaw, pitch)
 

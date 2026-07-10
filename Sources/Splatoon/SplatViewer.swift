@@ -144,7 +144,9 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     private var pressedKeys = Set<UInt16>()
     private var lastFrameTime: CFTimeInterval?
 
-    private let fovy: Float = 65 * .pi / 180
+    /// Vertical FOV: the registered camera's for scenes, SHARP's ~53° otherwise,
+    /// so a splat opens framed like its source photo.
+    private var fovy: Float { (initialPose?.fovyDegrees ?? sharpFOVyDegrees) * .pi / 180 }
     private let lookSensitivity: Float = 0.005
     private let moveSpeed: Float = 8      // world units per second
     private let panSensitivity: Float = 8 * 0.002   // world units per pixel dragged

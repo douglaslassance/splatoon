@@ -7,7 +7,6 @@ struct SplatDetailView: View {
     @ObservedObject var model: GalleryModel
     @EnvironmentObject var settings: MeshSettings
     let opened: GalleryModel.OpenedSplat
-    @State private var isLoading = true
     @State private var viewMode: ViewMode = .splat
 
     enum ViewMode: String { case splat, mesh }
@@ -15,10 +14,10 @@ struct SplatDetailView: View {
     var body: some View {
         content
             .ignoresSafeArea()
-            .overlay { if let info = progressInfo { progressOverlay(info) } }
             .overlay(alignment: .top) { toolbar }
-            .overlay(alignment: .bottom) { if progressInfo == nil && !isGenerating { hint } }
-            .animation(.easeInOut(duration: 0.2), value: progressInfo)
+            // All progress (generation, load, mesh build) shows in the docked bar
+            // at the window bottom; the hint hides while this splat has progress.
+            .overlay(alignment: .bottom) { if !hasProgress { hint } }
             // Rebuild the mesh preview when entering mesh mode, changing the opened
             // splat, or tweaking mesh settings. `.task(id:)` cancels/reruns on change.
             .task(id: meshTaskID) {
@@ -36,12 +35,13 @@ struct SplatDetailView: View {
     private var content: some View {
         switch viewMode {
         case .splat:
-            SplatViewer(url: opened.url, initialPose: opened.initialPose, onLoadingChange: { isLoading = $0 })
+            SplatViewer(url: opened.url, initialPose: opened.initialPose,
+                        onLoadingChange: { model.setSplatLoading($0) })
         case .mesh:
             if let mesh = model.openedMesh {
                 MeshViewer(mesh: mesh, initialPose: opened.initialPose)
             } else {
-                Color.clear   // progress overlay covers the build
+                Color.clear   // the docked bar shows "Building mesh…"
             }
         }
     }
@@ -51,49 +51,10 @@ struct SplatDetailView: View {
         "\(viewMode.rawValue)|\(opened.id)|\(opened.url != nil)|\(settings.signature(forScene: opened.isScene))"
     }
 
-    private struct ProgressInfo: Equatable {
-        var text: String
-        var fraction: Double?   // nil = indeterminate
-    }
-
-    /// Whether the opened splat (single- or multi-image) is still generating —
-    /// the docked bar (visible from anywhere, not just this screen) already shows
-    /// its staged progress, so the center overlay stays out of the way instead of
-    /// duplicating it.
-    private var isGenerating: Bool {
-        opened.url == nil && model.sceneProgress?.key == opened.id
-    }
-
-    /// The progress to show over the view, or nil when it's interactive (or
-    /// already shown in the docked bar — see `isGenerating`).
-    private var progressInfo: ProgressInfo? {
-        if isGenerating { return nil }
-        if let busy = model.busyMessage { return ProgressInfo(text: busy, fraction: nil) }
-        if opened.url == nil { return ProgressInfo(text: "Generating splat…", fraction: nil) }
-        switch viewMode {
-        case .splat:
-            return isLoading ? ProgressInfo(text: "Loading splat…", fraction: nil) : nil
-        case .mesh:
-            return model.openedMesh == nil ? ProgressInfo(text: "Building mesh…", fraction: nil) : nil
-        }
-    }
-
-    private func progressOverlay(_ info: ProgressInfo) -> some View {
-        ZStack {
-            Color.black.opacity(0.35).ignoresSafeArea()
-            VStack(spacing: 14) {
-                if let fraction = info.fraction {
-                    ProgressView(value: fraction).frame(width: 220)
-                } else {
-                    ProgressView().controlSize(.large)
-                }
-                Text(info.text).foregroundStyle(.white)
-            }
-            .padding(28)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        }
-        .allowsHitTesting(false)   // keep the toolbar (back) live during progress
-        .transition(.opacity)
+    /// Whether the docked bar is showing progress for this splat (generation,
+    /// load, or mesh build) — used to hide the control hint meanwhile.
+    private var hasProgress: Bool {
+        opened.url == nil || model.sceneProgress?.key == opened.id
     }
 
     private var toolbar: some View {
@@ -119,6 +80,15 @@ struct SplatDetailView: View {
             .labelsHidden()
 
             Spacer()
+
+            Button {
+                model.regenerateOpened(iterations: Int(settings.multiImageIterations))
+            } label: {
+                Label("Regenerate", systemImage: "arrow.clockwise")
+            }
+            .labelStyle(.iconOnly)
+            .help("Discard the cached splat and rebuild it from the original photo(s) or video.")
+            .disabled(opened.url == nil)
 
             Button {
                 model.openInSuperSplat()

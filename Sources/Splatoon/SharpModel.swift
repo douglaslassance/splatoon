@@ -95,17 +95,29 @@ final class SharpModelRunner {
     /// Resize a `CGImage` to the model's input resolution and pack it into a
     /// `(1, 3, H, W)` float32 `MLMultiArray` normalized to [0, 1].
     func preprocess(_ cgImage: CGImage) throws -> MLMultiArray {
-        let ciImage = CIImage(cgImage: cgImage)
         let context = CIContext()
+        let full = CIImage(cgImage: cgImage)
 
-        let scaleX = CGFloat(inputWidth) / ciImage.extent.width
-        let scaleY = CGFloat(inputHeight) / ciImage.extent.height
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        // Center-crop to a square before scaling, rather than stretching the photo
+        // to SHARP's square input. Stretching distorts non-square photos (and the
+        // resulting geometry); a centered square crop keeps proportions correct —
+        // at the cost of the photo's outer edges.
+        let side = min(full.extent.width, full.extent.height)
+        let cropRect = CGRect(x: full.extent.midX - side / 2, y: full.extent.midY - side / 2,
+                              width: side, height: side)
+        let scale = CGFloat(inputWidth) / side   // uniform (inputWidth == inputHeight)
+        let scaled = full.cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
-        guard let resized = context.createCGImage(
-            scaled,
-            from: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight)
-        ) else {
+        // Extract a rect whose size is EXACTLY inputWidth × inputHeight. `scaled.extent`
+        // can round to 1537 px (floating point on side*scale), and the packing loop below
+        // indexes with the fixed inputWidth/inputHeight — an oversized image would write
+        // past the MLMultiArray and segfault. Anchor at the scaled content's origin so the
+        // cropped square (not at (0,0) for non-square photos) is captured.
+        let outputRect = CGRect(origin: scaled.extent.origin,
+                                size: CGSize(width: inputWidth, height: inputHeight))
+        guard let resized = context.createCGImage(scaled, from: outputRect),
+              resized.width == inputWidth, resized.height == inputHeight else {
             throw SharpError.preprocessingFailed
         }
 

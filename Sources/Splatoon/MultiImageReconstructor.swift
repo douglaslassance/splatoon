@@ -8,7 +8,15 @@ struct ScenePose: Equatable {
     var eye: SIMD3<Float>
     var yaw: Float
     var pitch: Float
+    /// Vertical field of view of the registered camera, so the scene opens at the
+    /// same framing the photo was taken with.
+    var fovyDegrees: Float
 }
+
+/// SHARP's capture FOV: focal 1536 px on a 1536-px-tall square input →
+/// 2·atan(height / 2·focal) = 2·atan(0.5) ≈ 53.13°. Used as the single-image
+/// viewer's field of view so a splat opens framed like its source photo.
+let sharpFOVyDegrees = Float(2 * atan(0.5) * 180 / Double.pi)
 
 /// Reconstruction progress: a human stage label plus how far through the
 /// COLMAP+training pipeline we are, 0...1. Weighted toward training, which
@@ -237,11 +245,156 @@ final class MultiImageReconstructor {
             try? fm.removeItem(at: Self.camerasURL(for: output))
             try? fm.moveItem(at: writtenCameras, to: Self.camerasURL(for: output))
         }
+
+        // COLMAP's world frame is arbitrary (built off its bootstrap image pair),
+        // so scenes come out tilted — the horizon isn't level and the fly camera
+        // feels off. Rotate the splat + camera poses so the estimated gravity-up
+        // becomes world-up, matching single-image splats' upright convention.
+        Self.gravityAlign(plyURL: output, camerasURL: Self.camerasURL(for: output))
     }
 
     /// The registered camera poses OpenSplat trained against, scoped to `plyURL`.
     static func camerasURL(for plyURL: URL) -> URL {
         plyURL.deletingPathExtension().appendingPathExtension("cameras.json")
+    }
+
+    // MARK: - Gravity alignment
+
+    /// One camera as stored in OpenSplat's cameras.json (all fields preserved so
+    /// re-encoding after rotation doesn't drop anything downstream reads).
+    private struct SceneCamera: Codable {
+        var id: Int?
+        var img_name: String?
+        var width: Int?
+        var height: Int?
+        var fx: Float?
+        var fy: Float?
+        var position: [Float]
+        var rotation: [[Float]]
+    }
+
+    /// Rotate the scene so its estimated gravity-up aligns with the app's upright
+    /// convention. Estimates down as the average camera local-Y (OpenCV cameras
+    /// look with +Y down); handheld captures are roughly upright, so this
+    /// approximates gravity. Bakes the rotation into both `plyURL` and
+    /// `camerasURL` so everything downstream stays consistent.
+    static func gravityAlign(plyURL: URL, camerasURL: URL) {
+        guard let data = try? Data(contentsOf: camerasURL),
+              var cameras = try? JSONDecoder().decode([SceneCamera].self, from: data),
+              !cameras.isEmpty else { return }
+
+        var down = SIMD3<Float>(0, 0, 0)
+        for cam in cameras where cam.rotation.count == 3 && cam.rotation.allSatisfy({ $0.count == 3 }) {
+            // Camera-to-world column 1 = the camera's local +Y (down) in world.
+            down += SIMD3(cam.rotation[0][1], cam.rotation[1][1], cam.rotation[2][1])
+        }
+        let length = simd_length(down)
+        guard length > 1e-3 else { return }
+        down /= length
+
+        // Map estimated down -> (0,1,0). After the downstream OpenCV->OpenGL flip
+        // (π about X, shared by SplatViewer's calibration and MeshExport), up then
+        // lands on screen-up. Skip if the scene is already close to upright.
+        let rotation = simd_quatf(from: down, to: SIMD3<Float>(0, 1, 0))
+        guard rotation.angle.isFinite, abs(rotation.angle) > 0.02 else { return }
+
+        guard rotatePLY(plyURL, by: rotation) else { return }
+
+        for i in cameras.indices {
+            if cameras[i].position.count == 3 {
+                let p = simd_act(rotation, SIMD3(cameras[i].position[0], cameras[i].position[1], cameras[i].position[2]))
+                cameras[i].position = [p.x, p.y, p.z]
+            }
+            if cameras[i].rotation.count == 3 {
+                var r = cameras[i].rotation
+                for col in 0..<3 {
+                    let axis = simd_act(rotation, SIMD3(r[0][col], r[1][col], r[2][col]))
+                    r[0][col] = axis.x; r[1][col] = axis.y; r[2][col] = axis.z
+                }
+                cameras[i].rotation = r
+            }
+        }
+        if let encoded = try? JSONEncoder().encode(cameras) { try? encoded.write(to: camerasURL) }
+    }
+
+    /// Rotate a binary-little-endian 3DGS PLY in place: positions and normals as
+    /// vectors, the rotation quaternion (stored w,x,y,z) composed with `rotation`.
+    /// All other properties (colour, opacity, scale, SH bands) are untouched.
+    /// Returns false if the PLY couldn't be parsed/rotated.
+    private static func rotatePLY(_ url: URL, by rotation: simd_quatf) -> Bool {
+        guard var data = try? Data(contentsOf: url),
+              let headerRange = data.range(of: Data("end_header\n".utf8)),
+              let header = String(data: data.subdata(in: 0..<headerRange.upperBound), encoding: .ascii) else {
+            return false
+        }
+        var format = ""
+        var count = 0
+        var inVertex = false
+        var offset = 0
+        var offsetOf: [String: Int] = [:]
+        for line in header.split(separator: "\n") {
+            let parts = line.split(separator: " ").map(String.init)
+            guard let keyword = parts.first else { continue }
+            switch keyword {
+            case "format" where parts.count >= 2:
+                format = parts[1]
+            case "element" where parts.count >= 3:
+                inVertex = (parts[1] == "vertex")
+                if inVertex { count = Int(parts[2]) ?? 0 }
+            case "property" where inVertex && parts.count >= 3 && parts[1] != "list":
+                offsetOf[parts[2]] = offset
+                offset += typeSize(parts[1])
+            default:
+                break
+            }
+        }
+        let stride = offset
+        let bodyStart = headerRange.upperBound
+        guard format == "binary_little_endian", count > 0, stride > 0,
+              bodyStart + count * stride <= data.count,
+              let ox = offsetOf["x"], let oy = offsetOf["y"], let oz = offsetOf["z"] else {
+            return false
+        }
+        let normal = (offsetOf["nx"], offsetOf["ny"], offsetOf["nz"])
+        let quat = (offsetOf["rot_0"], offsetOf["rot_1"], offsetOf["rot_2"], offsetOf["rot_3"])
+
+        data.withUnsafeMutableBytes { rawMut in
+            let raw = UnsafeRawBufferPointer(rawMut)
+            func load(_ off: Int) -> Float { raw.loadUnaligned(fromByteOffset: off, as: Float.self) }
+            func store(_ value: Float, _ off: Int) {
+                var v = value
+                withUnsafeBytes(of: &v) { for k in 0..<4 { rawMut[off + k] = $0[k] } }
+            }
+            for i in 0..<count {
+                let base = bodyStart + i * stride
+                let p = simd_act(rotation, SIMD3(load(base + ox), load(base + oy), load(base + oz)))
+                store(p.x, base + ox); store(p.y, base + oy); store(p.z, base + oz)
+
+                if let nx = normal.0, let ny = normal.1, let nz = normal.2 {
+                    let n = simd_act(rotation, SIMD3(load(base + nx), load(base + ny), load(base + nz)))
+                    store(n.x, base + nx); store(n.y, base + ny); store(n.z, base + nz)
+                }
+                if let r0 = quat.0, let r1 = quat.1, let r2 = quat.2, let r3 = quat.3 {
+                    // Stored (w, x, y, z); new orientation = rotation * old.
+                    let old = simd_quatf(ix: load(base + r1), iy: load(base + r2), iz: load(base + r3), r: load(base + r0))
+                    let composed = rotation * old
+                    store(composed.real, base + r0)
+                    store(composed.imag.x, base + r1)
+                    store(composed.imag.y, base + r2)
+                    store(composed.imag.z, base + r3)
+                }
+            }
+        }
+        do { try data.write(to: url); return true } catch { return false }
+    }
+
+    private static func typeSize(_ type: String) -> Int {
+        switch type {
+        case "char", "uchar", "int8", "uint8": return 1
+        case "short", "ushort", "int16", "uint16": return 2
+        case "double", "float64", "int64", "uint64": return 8
+        default: return 4   // float/float32, int/uint/int32/uint32
+        }
     }
 
     /// Every COLMAP sparse model under `sparseDir` (each numbered subfolder that
@@ -325,6 +478,8 @@ final class MultiImageReconstructor {
         struct Camera: Decodable {
             let position: [Float]
             let rotation: [[Float]]
+            let fy: Float?
+            let height: Int?
         }
         guard let data = try? Data(contentsOf: camerasURL(for: plyURL)),
               let cameras = try? JSONDecoder().decode([Camera].self, from: data),
@@ -346,7 +501,16 @@ final class MultiImageReconstructor {
         // Invert SplatViewer's own forwardVector(yaw,pitch) formula.
         let pitch = asin(max(-1, min(1, forward.y)))
         let yaw = atan2(forward.x, -forward.z)
-        return ScenePose(eye: eye, yaw: yaw, pitch: pitch)
+
+        // Vertical FOV from the camera's calibrated focal length + image height,
+        // so the scene opens framed like the photo. Fall back to SHARP's default.
+        let fovy: Float
+        if let fy = cam.fy, let h = cam.height, fy > 0 {
+            fovy = Float(2 * atan(Double(h) / (2 * Double(fy))) * 180 / Double.pi)
+        } else {
+            fovy = sharpFOVyDegrees
+        }
+        return ScenePose(eye: eye, yaw: yaw, pitch: pitch, fovyDegrees: fovy)
     }
 
     /// The first match's capture groups as strings, or nil if `pattern` doesn't

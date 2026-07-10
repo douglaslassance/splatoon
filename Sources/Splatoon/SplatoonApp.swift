@@ -22,6 +22,12 @@ struct SplatoonApp: App {
         if CommandLine.arguments.contains("--selftest-scene") {
             runSceneSelfTest()
         }
+        if CommandLine.arguments.contains("--selftest-server") {
+            runServerSelfTest()
+        }
+        if CommandLine.arguments.contains("--selftest-align") {
+            runAlignSelfTest()
+        }
         if CommandLine.arguments.contains("--selftest-video") {
             runVideoSelfTest()
         }
@@ -366,6 +372,40 @@ private func writePNG(from texture: MTLTexture, to url: URL) throws {
     guard CGImageDestinationFinalize(destination) else {
         throw NSError(domain: "SelfTest", code: 9, userInfo: [NSLocalizedDescriptionKey: "Could not finalize PNG"])
     }
+}
+
+/// Gravity-aligns a scene PLY + cameras.json in place, for verification.
+/// Usage: `Splatoon --selftest-align <ply> <cameras.json>`.
+private func runAlignSelfTest() -> Never {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: "--selftest-align"), args.count > idx + 2 else {
+        print("SELFTEST align: usage --selftest-align <ply> <cameras.json>"); exit(1)
+    }
+    MultiImageReconstructor.gravityAlign(plyURL: URL(fileURLWithPath: args[idx + 1]),
+                                         camerasURL: URL(fileURLWithPath: args[idx + 2]))
+    print("SELFTEST align OK")
+    exit(0)
+}
+
+/// Serves a file over the loopback HTTP server and prints its URL, then stays
+/// alive so the served file can be fetched (e.g. via curl) to verify the server
+/// + CORS. Usage: `Splatoon --selftest-server <file>`.
+private func runServerSelfTest() -> Never {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: "--selftest-server"), args.count > idx + 1 else {
+        print("SELFTEST server: usage --selftest-server <file>"); exit(1)
+    }
+    setvbuf(stdout, nil, _IONBF, 0)   // unbuffered — this hook never exits to flush
+    let file = URL(fileURLWithPath: args[idx + 1])
+    Task { @MainActor in
+        if let url = await LocalFileServer.shared.servedURL(for: file) {
+            print("SELFTEST server SERVING \(url.absoluteString)")
+        } else {
+            print("SELFTEST server: failed to start"); exit(1)
+        }
+    }
+    RunLoop.main.run()   // keep alive for the fetch
+    exit(0)
 }
 
 /// Creates a `SplatRenderer` in the real app-bundle context to verify that
