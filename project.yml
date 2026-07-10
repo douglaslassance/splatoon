@@ -1,6 +1,6 @@
 name: Splatoon
 options:
-  bundleIdPrefix: com.douglaslassance
+  bundleIdPrefix: me.douglaslassance
   createIntermediateGroups: true
   deploymentTarget:
     macOS: "15.0"
@@ -33,7 +33,7 @@ targets:
         NSPhotoLibraryUsageDescription: "Splatoon reads your photos so you can turn them into 3D Gaussian splats. Images are processed on your device."
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.douglaslassance.Splatoon
+        PRODUCT_BUNDLE_IDENTIFIER: me.douglaslassance.splatoon
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: NO

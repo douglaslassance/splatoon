@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP="$ROOT/Splatoon.app"
-BUNDLE_ID="com.douglaslassance.Splatoon"
+BUNDLE_ID="me.douglaslassance.splatoon"
 EXECUTABLE="Splatoon"
 
 echo "==> swift build -c $CONFIG"
@@ -100,7 +100,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> Ad-hoc code signing"
-codesign --force --deep --sign - "$APP"
+# Code signing. A stable identity keeps macOS's privacy database (TCC) grants —
+# e.g. Photo Library access — across rebuilds. Ad-hoc signatures are keyed by the
+# binary's cdhash, which changes every build, so TCC forgets the grant each time.
+# Prefer a self-signed dev identity (scripts/create-signing-cert.sh) if present;
+# otherwise fall back to ad-hoc. Override with SIGN_IDENTITY=... .
+SIGN_IDENTITY="${SIGN_IDENTITY:-Splatoon Dev}"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+  echo "==> Code signing with '$SIGN_IDENTITY' (stable, keeps Photos permission)"
+  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+else
+  echo "==> Ad-hoc code signing (run scripts/create-signing-cert.sh to persist Photos permission)"
+  codesign --force --deep --sign - "$APP"
+fi
 
 echo "==> Done: $APP"
