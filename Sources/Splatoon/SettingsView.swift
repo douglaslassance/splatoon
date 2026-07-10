@@ -1,51 +1,66 @@
 import SwiftUI
 
-/// The app Settings panel (⌘,). Lets the user choose the mesh export method and
-/// tune its parameters. Uses GroupBox cards so sliders span the full width.
+/// The app Settings panel (⌘,), split into tabs so each fits without scrolling:
+/// single-image (SHARP) meshing, and multi-image (scene) reconstruction + meshing.
 struct SettingsView: View {
     @ObservedObject var settings: MeshSettings
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                sceneDetectionCard
-                methodCard
-                optionsCard
-            }
-            .padding(20)
+        TabView {
+            singleImageTab
+                .tabItem { Label("Single Image", systemImage: "photo") }
+            multiImageTab
+                .tabItem { Label("Multi-Image", systemImage: "square.stack.3d.up") }
         }
-        .frame(width: 460)
-        .frame(minHeight: 360)
+        .frame(width: 480)
+        .padding(20)
     }
+
+    // MARK: - Tabs
+
+    private var singleImageTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            methodCard(selection: $settings.singleImageMethod, cases: MeshMethod.allCases)
+            optionsCard(for: settings.singleImageMethod)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var multiImageTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sceneDetectionCard
+            methodCard(selection: $settings.sceneMethod, cases: MeshMethod.sceneCases)
+            optionsCard(for: settings.sceneMethod)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Cards
 
     private var sceneDetectionCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Reconstruct multi-image scenes", isOn: $settings.useMultiImageReconstruction)
-                    Text("When a photo has several same-place/time siblings, combine them into one "
-                         + "multi-view splat (COLMAP + OpenSplat) instead of using just the tapped photo. "
-                         + "Off always uses single-image reconstruction.")
+                    Text("When a photo has several same-place/time siblings, or you open a video, "
+                         + "reconstruct a multi-view splat (COLMAP + OpenSplat) instead of a single-image one.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 sliderRow(title: "Training steps",
                           valueText: "\(Int(settings.multiImageIterations)) (~\(estimatedMinutes) min)",
                           value: $settings.multiImageIterations, range: 1000...30000, step: 500,
-                          caption: "How long the multi-view trainer runs. Too few steps and the splat "
-                              + "stays blurry — densification only starts after step 500, and quality keeps "
-                              + "improving well past 15000. Higher is sharper but slower. The time is a rough "
-                              + "estimate (~13 steps/sec) — actual speed depends on your Mac.")
+                          caption: "How long the multi-view trainer runs. Too few and the splat stays blurry; "
+                              + "quality keeps improving well past 15000. Higher is sharper but slower. "
+                              + "Time is a rough estimate (~13 steps/sec) — actual speed depends on your Mac.")
                     .disabled(!settings.useMultiImageReconstruction)
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
 
                 Label {
-                    Text("For best results, capture a **slow continuous orbit**: keep the subject "
-                         + "framed and take many overlapping photos, each stepping only slightly from "
-                         + "the last. A few photos from spread-out angles won't align — the aligner "
-                         + "needs consecutive shots to share most of their view.")
+                    Text("For best results use a **video**, or many overlapping photos in a slow continuous "
+                         + "orbit — spread-out angles won't align.")
                         .font(.caption).foregroundStyle(.secondary)
                 } icon: {
-                    Image(systemName: "camera.on.rectangle").foregroundStyle(.secondary)
+                    Image(systemName: "video").foregroundStyle(.secondary)
                 }
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
             }
@@ -56,22 +71,16 @@ struct SettingsView: View {
         }
     }
 
-    private var estimatedMinutes: Int {
-        max(1, Int((settings.multiImageIterations / 12.85 / 60).rounded()))
-    }
-
-    private var methodCard: some View {
+    private func methodCard(selection: Binding<MeshMethod>, cases: [MeshMethod]) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                Picker("Method", selection: $settings.method) {
-                    ForEach(MeshMethod.allCases) { method in
-                        Text(method.displayName).tag(method)
-                    }
+                Picker("Mesh method", selection: selection) {
+                    ForEach(cases) { method in Text(method.displayName).tag(method) }
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
 
-                Text(settings.method.detail)
+                Text(selection.wrappedValue.detail)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -84,8 +93,8 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private var optionsCard: some View {
-        switch settings.method {
+    private func optionsCard(for method: MeshMethod) -> some View {
+        switch method {
         case .grid:
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {
@@ -125,6 +134,10 @@ struct SettingsView: View {
                 Text("Poisson options").font(.headline)
             }
         }
+    }
+
+    private var estimatedMinutes: Int {
+        max(1, Int((settings.multiImageIterations / 12.85 / 60).rounded()))
     }
 
     /// A label + value header on one line, with a full-width slider beneath it.

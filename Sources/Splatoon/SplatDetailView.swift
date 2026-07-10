@@ -23,8 +23,8 @@ struct SplatDetailView: View {
             // splat, or tweaking mesh settings. `.task(id:)` cancels/reruns on change.
             .task(id: meshTaskID) {
                 guard viewMode == .mesh, opened.url != nil else { return }
-                model.buildOpenedMesh(settingsSignature: settings.signature,
-                                      method: settings.method,
+                model.buildOpenedMesh(settingsSignature: settings.signature(forScene: opened.isScene),
+                                      method: settings.method(forScene: opened.isScene),
                                       smoothGrid: settings.smoothGrid,
                                       depthRatioCull: Float(settings.depthRatioCull),
                                       surfelExtent: Float(settings.surfelExtent),
@@ -48,7 +48,7 @@ struct SplatDetailView: View {
 
     /// Identity for the mesh-rebuild task: mode, splat, availability, and settings.
     private var meshTaskID: String {
-        "\(viewMode.rawValue)|\(opened.id)|\(opened.url != nil)|\(settings.signature)"
+        "\(viewMode.rawValue)|\(opened.id)|\(opened.url != nil)|\(settings.signature(forScene: opened.isScene))"
     }
 
     private struct ProgressInfo: Equatable {
@@ -148,7 +148,7 @@ struct SplatDetailView: View {
         case .splat:
             model.exportOpened()
         case .mesh:
-            model.exportMesh(method: settings.method,
+            model.exportMesh(method: settings.method(forScene: opened.isScene),
                              smoothGrid: settings.smoothGrid,
                              depthRatioCull: Float(settings.depthRatioCull),
                              surfelExtent: Float(settings.surfelExtent),

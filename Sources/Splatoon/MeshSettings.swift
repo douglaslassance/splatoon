@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The available mesh-generation strategies, shown in the Settings panel.
 enum MeshMethod: String, CaseIterable, Identifiable {
-    /// Connect the Gaussian grid into a 2.5D relief surface (default).
+    /// Connect the Gaussian pixel grid into a 2.5D relief surface.
     case grid
     /// One oriented quad ("surfel") per Gaussian, sized and oriented by its shape.
     case surfel
@@ -11,9 +11,14 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// Methods offered for multi-view scene splats. Grid needs SHARP's structured
+    /// pixel grid, which scene (COLMAP + OpenSplat) splats don't have, so it's
+    /// excluded here.
+    static let sceneCases: [MeshMethod] = [.surfel, .poisson]
+
     var displayName: String {
         switch self {
-        case .grid: return "Grid surface (single-image only)"
+        case .grid: return "Grid surface"
         case .surfel: return "Surfels (per-splat quads)"
         case .poisson: return "Poisson reconstruction"
         }
@@ -22,12 +27,12 @@ enum MeshMethod: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .grid:
-            return "Connects the splat grid into a single 2.5D surface. Fast, on-device. "
-                + "Needs a single-image splat's structured grid; multi-image scenes fall back to Poisson automatically."
+            return "Connects the splat's pixel grid into a single 2.5D surface. Fast, on-device."
         case .surfel:
-            return "Emits one oriented quad per splat. Faithful to each splat's shape, but not a connected surface. Works for single- and multi-image splats."
+            return "Emits one oriented quad per splat. Faithful to each splat's shape, but not a connected surface."
         case .poisson:
-            return "Volumetric reconstruction (TSDF + marching tetrahedra) from the oriented point cloud. Smoother and hole-filled; on-device stand-in for screened Poisson. Works for single- and multi-image splats."
+            return "Volumetric reconstruction (TSDF + marching tetrahedra) from the oriented point cloud. "
+                + "Smoother and hole-filled; an on-device stand-in for screened Poisson."
         }
     }
 }
@@ -48,8 +53,14 @@ final class MeshSettings: ObservableObject {
     @Published var multiImageIterations: Double {
         didSet { defaults.set(multiImageIterations, forKey: Keys.multiImageIterations) }
     }
-    @Published var method: MeshMethod {
-        didSet { defaults.set(method.rawValue, forKey: Keys.method) }
+    /// Mesh method for single-image (SHARP) splats — any of the three.
+    @Published var singleImageMethod: MeshMethod {
+        didSet { defaults.set(singleImageMethod.rawValue, forKey: Keys.singleImageMethod) }
+    }
+    /// Mesh method for multi-view scene splats — Surfels or Poisson only (Grid
+    /// needs a structured pixel grid these splats don't have).
+    @Published var sceneMethod: MeshMethod {
+        didSet { defaults.set(sceneMethod.rawValue, forKey: Keys.sceneMethod) }
     }
     /// Grid: smooth the surface (Laplacian) to reduce depth noise.
     @Published var smoothGrid: Bool {
@@ -68,17 +79,23 @@ final class MeshSettings: ObservableObject {
         didSet { defaults.set(poissonResolution, forKey: Keys.poissonResolution) }
     }
 
-    /// Changes whenever any meshing-relevant setting changes; used to key the
-    /// in-app mesh preview cache so it rebuilds when the user tweaks settings.
-    var signature: String {
-        "\(method.rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)|\(poissonResolution)"
+    /// The mesh method for the given splat kind.
+    func method(forScene isScene: Bool) -> MeshMethod {
+        isScene ? sceneMethod : singleImageMethod
+    }
+
+    /// Changes whenever a meshing setting relevant to `isScene` changes; used to
+    /// key the in-app mesh preview cache so it rebuilds when the user tweaks it.
+    func signature(forScene isScene: Bool) -> String {
+        "\(method(forScene: isScene).rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)|\(poissonResolution)"
     }
 
     private let defaults = UserDefaults.standard
     private enum Keys {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
         static let multiImageIterations = "reconstruction.multiImageIterations"
-        static let method = "mesh.method"
+        static let singleImageMethod = "mesh.singleImageMethod"
+        static let sceneMethod = "mesh.sceneMethod"
         static let smoothGrid = "mesh.smoothGrid"
         static let depthRatioCull = "mesh.depthRatioCull"
         static let surfelExtent = "mesh.surfelExtent"
@@ -88,8 +105,8 @@ final class MeshSettings: ObservableObject {
     init() {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
-        let raw = defaults.string(forKey: Keys.method) ?? MeshMethod.grid.rawValue
-        method = MeshMethod(rawValue: raw) ?? .grid
+        singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
+        sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .poisson
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false
         depthRatioCull = defaults.object(forKey: Keys.depthRatioCull) as? Double ?? 1.5
         surfelExtent = defaults.object(forKey: Keys.surfelExtent) as? Double ?? 2.0

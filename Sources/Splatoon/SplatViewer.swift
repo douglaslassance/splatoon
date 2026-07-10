@@ -53,9 +53,36 @@ struct SplatViewer: NSViewRepresentable {
 /// A Metal view that forwards mouse and keyboard input to the fly camera.
 final class CameraMTKView: MTKView {
     weak var coordinator: SplatViewerCoordinator?
+    private var activityObservers: [NSObjectProtocol] = []
 
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool { true }
+
+    // Render only while the app is active. A continuously-rendering MTKView left
+    // in the background for hours needlessly burns GPU and compounds any
+    // per-frame allocation — a likely source of runaway memory growth.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, activityObservers.isEmpty else {
+            if window == nil { removeActivityObservers() }
+            return
+        }
+        isPaused = !NSApp.isActive
+        let center = NotificationCenter.default
+        activityObservers = [
+            center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                               queue: .main) { [weak self] _ in self?.isPaused = true },
+            center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil,
+                               queue: .main) { [weak self] _ in self?.isPaused = false },
+        ]
+    }
+
+    private func removeActivityObservers() {
+        activityObservers.forEach(NotificationCenter.default.removeObserver)
+        activityObservers.removeAll()
+    }
+
+    deinit { removeActivityObservers() }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)

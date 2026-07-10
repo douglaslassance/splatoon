@@ -7,6 +7,12 @@ import CoreGraphics
 import AVFoundation
 import UniformTypeIdentifiers
 
+/// One shared, reused CIContext. Creating a CIContext per image (as this code
+/// used to) is a documented anti-pattern — each allocates Metal resources and an
+/// internal cache — and over a session of 24 MP decodes it leaks heavily.
+/// CIContext is thread-safe, so a single shared instance is correct.
+private let sharedCIContext = CIContext()
+
 /// Drives the Photos-library gallery: authorization, asset listing, thumbnail
 /// image manager, per-image splat generation, and an on-disk splat cache.
 @MainActor
@@ -41,9 +47,19 @@ final class GalleryModel: ObservableObject {
         PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published private(set) var assets: [PHAsset] = []
     @Published private(set) var splatIdentifiers: Set<String> = []
+    /// A scene reconstruction that failed but can still fall back to single-image
+    /// SHARP on the asset the user tapped. Drives a recoverable alert (Use Single
+    /// Image / Cancel) instead of a dead-end "OK".
+    struct SceneFailure: Identifiable {
+        let message: String
+        let asset: PHAsset
+        var id: String { asset.localIdentifier }
+    }
+
     @Published var opened: OpenedSplat?
     @Published private(set) var busyMessage: String?
     @Published private(set) var sceneProgress: SceneProgress?
+    @Published var sceneFailure: SceneFailure?
     @Published var errorMessage: String?
 
     /// The mesh preview for the currently opened splat, built lazily when the
@@ -143,7 +159,7 @@ final class GalleryModel: ObservableObject {
         if allowMultiImage {
             let group = SceneGrouping.neighbors(of: asset, in: assets)
             if SceneGrouping.isScene(group) {
-                openScene(group, iterations: multiImageIterations)
+                openScene(group, hero: asset, iterations: multiImageIterations)
                 return
             }
         }
@@ -298,11 +314,12 @@ final class GalleryModel: ObservableObject {
 
     /// Reconstruct a splat from several photos of the same scene, caching the
     /// result like a single-image splat.
-    private func openScene(_ group: [PHAsset], iterations: Int) {
+    private func openScene(_ group: [PHAsset], hero: PHAsset, iterations: Int) {
         // Iteration count is part of the cache key so raising it in Settings and
         // reopening actually retrains, instead of silently reusing a blurrier cache.
         let key = SceneGrouping.sceneKey(for: group) + "-i\(iterations)"
-        startSceneReconstruction(key: key, title: "Scene · \(group.count) photos", iterations: iterations) { imagesDir, report in
+        startSceneReconstruction(key: key, title: "Scene · \(group.count) photos",
+                                 iterations: iterations, hero: hero) { imagesDir, report in
             var written = 0
             for (index, asset) in group.enumerated() {
                 if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
@@ -317,11 +334,70 @@ final class GalleryModel: ObservableObject {
     /// registration failures.
     private func openVideoScene(_ asset: PHAsset, iterations: Int) {
         let key = "video-" + SceneGrouping.stableHash(asset.localIdentifier) + "-i\(iterations)"
-        startSceneReconstruction(key: key, title: "Video scene", iterations: iterations) { imagesDir, report in
+        startSceneReconstruction(key: key, title: "Video scene", iterations: iterations, hero: asset) { imagesDir, report in
             await self.extractVideoFrames(from: asset, to: imagesDir) { done, total in
                 report("Extracting \(total) frames…", Double(done) / Double(max(total, 1)))
             }
         }
+    }
+
+    /// Recover from a failed scene by running single-image SHARP on the asset the
+    /// user tapped (its middle frame, for a video). Driven by the failure alert.
+    func fallbackToSingleImage() {
+        guard let failure = sceneFailure else { return }
+        let asset = failure.asset
+        sceneFailure = nil
+        if asset.mediaType == .video {
+            openVideoSingleFrame(asset)
+        } else {
+            open(asset, allowMultiImage: false)   // straight to SHARP, no re-grouping
+        }
+    }
+
+    /// SHARP on a video's middle frame — the single-image fallback for a video.
+    private func openVideoSingleFrame(_ asset: PHAsset) {
+        resetOpenedMesh()
+        let identifier = asset.localIdentifier
+        let destination = splatURL(for: identifier)
+        let title = Self.title(for: asset)
+
+        if FileManager.default.fileExists(atPath: destination.path) {
+            opened = OpenedSplat(id: identifier, title: title, url: destination)
+            return
+        }
+        guard let modelURL = ModelLocator.resolveModelURL() else {
+            errorMessage = "No SHARP model found. Run scripts/fetch-model.sh, then choose sharp.mlpackage."
+            return
+        }
+
+        opened = OpenedSplat(id: identifier, title: title, url: nil)
+        sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Extracting frame…",
+                                      fraction: 0.05, isScene: false, cancellable: false)
+        Task { @MainActor in
+            guard let cgImage = await self.middleVideoFrame(from: asset) else {
+                self.failGeneration(key: identifier, message: "Could not read a frame from the video.")
+                return
+            }
+            self.generate(cgImage: cgImage, identifier: identifier, title: title,
+                          modelURL: modelURL, destination: destination)
+        }
+    }
+
+    /// Decode the frame at the midpoint of a Photos video, orientation baked in.
+    private func middleVideoFrame(from asset: PHAsset) async -> CGImage? {
+        let avAsset: AVAsset? = await withCheckedContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+                continuation.resume(returning: avAsset)
+            }
+        }
+        guard let avAsset, let duration = try? await avAsset.load(.duration) else { return nil }
+        let generator = AVAssetImageGenerator(asset: avAsset)
+        generator.appliesPreferredTrackTransform = true
+        let mid = CMTime(seconds: CMTimeGetSeconds(duration) / 2, preferredTimescale: 600)
+        return try? await generator.image(at: mid).image
     }
 
     /// Shared reconstruction driver used by both photo-group and video scenes.
@@ -331,7 +407,7 @@ final class GalleryModel: ObservableObject {
     /// error handling — is identical. Runs in the background regardless of
     /// navigation; `sceneProgress` tracks it independently of `opened`.
     private func startSceneReconstruction(
-        key: String, title: String, iterations: Int,
+        key: String, title: String, iterations: Int, hero: PHAsset,
         prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
     ) {
         let destination = splatURL(for: key)
@@ -410,11 +486,12 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     self.sceneReconstructor = nil
                     self.sceneProgress = nil
+                    if self.opened?.id == key { self.opened = nil }
                     if case MultiImageReconstructor.ReconstructionError.cancelled = error {
-                        if self.opened?.id == key { self.opened = nil }
+                        // User cancelled; stay silent.
                     } else {
-                        self.errorMessage = "Scene reconstruction failed: \(error.localizedDescription)"
-                        if self.opened?.id == key { self.opened = nil }
+                        // Recoverable: offer single-image SHARP on the tapped asset.
+                        self.sceneFailure = SceneFailure(message: error.localizedDescription, asset: hero)
                     }
                 }
             }
@@ -624,15 +701,17 @@ final class GalleryModel: ObservableObject {
     /// Decodes image data, baking in EXIF orientation so portrait photos are
     /// upright for the model.
     private nonisolated static func decodeOriented(_ data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let raw = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
-        let rawOrientation = (properties?[kCGImagePropertyOrientation] as? UInt32) ?? 1
-        guard rawOrientation != 1,
-              let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
-            return raw
+        autoreleasepool {   // drain the large intermediate CG/CI buffers promptly
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let raw = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+            let rawOrientation = (properties?[kCGImagePropertyOrientation] as? UInt32) ?? 1
+            guard rawOrientation != 1,
+                  let orientation = CGImagePropertyOrientation(rawValue: rawOrientation) else {
+                return raw
+            }
+            let ciImage = CIImage(cgImage: raw).oriented(orientation)
+            return sharedCIContext.createCGImage(ciImage, from: ciImage.extent) ?? raw
         }
-        let ciImage = CIImage(cgImage: raw).oriented(orientation)
-        return CIContext(options: nil).createCGImage(ciImage, from: ciImage.extent) ?? raw
     }
 }

@@ -19,6 +19,14 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+        .alert("Couldn't build the scene",
+               isPresented: Binding(get: { model.sceneFailure != nil },
+                                    set: { if !$0 { model.sceneFailure = nil } })) {
+            Button("Use Single Image") { model.fallbackToSingleImage() }
+            Button("Cancel", role: .cancel) { model.sceneFailure = nil }
+        } message: {
+            Text((model.sceneFailure?.message ?? "") + "\n\nUse single-image reconstruction on the photo you tapped instead?")
+        }
     }
 
     @ViewBuilder
