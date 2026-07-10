@@ -227,15 +227,37 @@ final class MultiImageReconstructor {
 
         // 4. Train the Gaussian splat. OpenSplat prints its own percentage
         // (relative to -n), already exactly what we want for `within`.
-        report(bands[3], within: 0)
-        try runTool(trainer, stage: "training", workDir: workDir, args: [
-            workDir.path,
-            "-n", String(trainingIterations),
-            "-o", output.path,
-        ]) { line in
-            guard let caps = Self.captures(#"Step \d+: [^(]*\((\d+)%\)"#, in: line),
-                  let percent = Double(caps[0]) else { return }
-            report(bands[3], within: percent / 100)
+        //
+        // OpenSplat's Metal (MPS) backend hard-crashes (SIGSEGV) during image
+        // loading on some builds — reliably so with the 1.1.5 Homebrew binary,
+        // even for a couple dozen images. Its CPU backend is reliable but much
+        // slower. So try the GPU path first and, if the trainer dies, retry once
+        // on CPU rather than failing the whole reconstruction after COLMAP.
+        func trainArgs(cpu: Bool) -> [String] {
+            var args = [workDir.path, "-n", String(trainingIterations), "-o", output.path]
+            if cpu { args.append("--cpu") }
+            return args
+        }
+        let trainBand = bands[3]
+        let cpuBand = (stage: "Training splat (CPU, slower)…", start: trainBand.start, end: trainBand.end)
+        func onTrainLine(_ band: (stage: String, start: Double, end: Double)) -> (String) -> Void {
+            { line in
+                guard let caps = Self.captures(#"Step \d+: [^(]*\((\d+)%\)"#, in: line),
+                      let percent = Double(caps[0]) else { return }
+                report(band, within: percent / 100)
+            }
+        }
+
+        report(trainBand, within: 0)
+        do {
+            try runTool(trainer, stage: "training", workDir: workDir,
+                        args: trainArgs(cpu: false), onLine: onTrainLine(trainBand))
+        } catch ReconstructionError.toolFailed {
+            // GPU trainer crashed. Don't retry if the user cancelled meanwhile.
+            if isCancelled { throw ReconstructionError.cancelled }
+            report(cpuBand, within: 0)
+            try runTool(trainer, stage: "training (CPU)", workDir: workDir,
+                        args: trainArgs(cpu: true), onLine: onTrainLine(cpuBand))
         }
 
         guard fm.fileExists(atPath: output.path) else { throw ReconstructionError.noOutput }
