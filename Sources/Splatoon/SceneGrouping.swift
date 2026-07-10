@@ -2,30 +2,51 @@ import Foundation
 import Photos
 import CoreLocation
 
-/// Decides, at open time, whether a tapped photo is a lone shot (single-image
-/// SHARP) or one of several capturing the same place/moment (multi-view
-/// reconstruction). Grouping is by burst, then by a timestamp window and, when
-/// GPS is present on both, a distance radius.
+/// Decides, at open time, whether a tapped asset is a lone shot (single-image
+/// SHARP) or one of several photos/videos capturing the same place (multi-view
+/// reconstruction). Grouping is by burst, then by location and, depending on
+/// the match mode, a timestamp window. Photos and videos group together, so a
+/// scene can mix stills and clips.
 enum SceneGrouping {
 
-    /// Members within this many seconds of the tapped photo may join its scene.
+    /// How siblings are matched into one scene.
+    enum MatchMode: String, CaseIterable, Identifiable {
+        /// Same place *and* captured close together (burst / time window / GPS
+        /// radius). The safe default: it won't merge unrelated shots that only
+        /// share a location.
+        case timeAndLocation
+        /// Same place only, regardless of when. Groups shots of one place taken
+        /// on different days. Needs GPS on both assets; without it there's no way
+        /// to tell same-place captures apart across time.
+        case locationOnly
+
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .timeAndLocation: return "Time and location"
+            case .locationOnly: return "Location only"
+            }
+        }
+    }
+
+    /// Members within this many seconds of the tapped asset may join its scene.
     static let timeWindow: TimeInterval = 90
-    /// When both photos carry GPS, they must be within this many metres.
+    /// When both assets carry GPS, they must be within this many metres.
     static let maxDistance: CLLocationDistance = 25
-    /// A group needs at least this many members to be reconstructed as a scene.
+    /// A photo-only group needs at least this many members to be a scene. (A
+    /// video is a scene on its own, since it yields many frames.)
     static let minSceneSize = 3
 
-    /// The photos that plausibly capture the same scene as `asset`, including
-    /// `asset` itself. `assets` is the full library listing.
-    static func neighbors(of asset: PHAsset, in assets: [PHAsset]) -> [PHAsset] {
+    /// The photos and videos that plausibly capture the same scene as `asset`,
+    /// including `asset` itself. `assets` is the full library listing.
+    static func neighbors(of asset: PHAsset, in assets: [PHAsset],
+                          matchMode: MatchMode = .timeAndLocation) -> [PHAsset] {
         let targetDate = asset.creationDate
         let targetLocation = asset.location
         let burst = asset.burstIdentifier
 
         var group: [PHAsset] = []
         for candidate in assets {
-            // Photo grouping is image-only; a video is its own multi-view scene.
-            guard candidate.mediaType == .image else { continue }
             if candidate.localIdentifier == asset.localIdentifier {
                 group.append(candidate)
                 continue
@@ -35,22 +56,34 @@ enum SceneGrouping {
                 group.append(candidate)
                 continue
             }
-            // Otherwise require a close timestamp…
-            guard let t0 = targetDate, let t1 = candidate.creationDate,
-                  abs(t1.timeIntervalSince(t0)) <= timeWindow else { continue }
-            // …and, when GPS is available on both, a close location. Photos without
-            // GPS fall back to the time window alone.
-            if let l0 = targetLocation, let l1 = candidate.location,
-               l1.distance(from: l0) > maxDistance {
-                continue
+            switch matchMode {
+            case .timeAndLocation:
+                // Require a close timestamp…
+                guard let t0 = targetDate, let t1 = candidate.creationDate,
+                      abs(t1.timeIntervalSince(t0)) <= timeWindow else { continue }
+                // …and, when GPS is available on both, a close location. Assets
+                // without GPS fall back to the time window alone.
+                if let l0 = targetLocation, let l1 = candidate.location,
+                   l1.distance(from: l0) > maxDistance {
+                    continue
+                }
+                group.append(candidate)
+            case .locationOnly:
+                // Same place regardless of time. Both must carry GPS.
+                guard let l0 = targetLocation, let l1 = candidate.location,
+                      l1.distance(from: l0) <= maxDistance else { continue }
+                group.append(candidate)
             }
-            group.append(candidate)
         }
         return group
     }
 
-    /// Whether a group is large enough to reconstruct as a multi-view scene.
-    static func isScene(_ group: [PHAsset]) -> Bool { group.count >= minSceneSize }
+    /// Whether a group warrants multi-view reconstruction: any video yields many
+    /// overlapping frames on its own; otherwise it takes at least `minSceneSize`
+    /// photos.
+    static func isScene(_ group: [PHAsset]) -> Bool {
+        group.contains { $0.mediaType == .video } || group.count >= minSceneSize
+    }
 
     /// A stable cache key for a scene, independent of member order and stable
     /// across launches (a deterministic FNV-1a hash, unlike `String.hashValue`).

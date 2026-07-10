@@ -97,9 +97,12 @@ final class MultiImageReconstructor {
     /// Run COLMAP + OpenSplat end to end. `imagesDir` holds the prepared photos;
     /// `workDir` is scratch space; the splat is written to `output`. `totalImages`
     /// is the pose-solving denominator for the mapping stage's live progress.
-    /// `progress` reports a stage label and an overall 0...1 fraction across the
-    /// whole pipeline (dispatch to the UI is the caller's job).
-    func run(imagesDir: URL, workDir: URL, output: URL, totalImages: Int,
+    /// `sharedCamera` assumes one shared intrinsic across all frames (right for a
+    /// single video or a one-phone photo group); pass false for mixed or
+    /// multi-clip scenes so COLMAP solves intrinsics per image. `progress` reports
+    /// a stage label and an overall 0...1 fraction across the whole pipeline
+    /// (dispatch to the UI is the caller's job).
+    func run(imagesDir: URL, workDir: URL, output: URL, totalImages: Int, sharedCamera: Bool = true,
             progress: @escaping (ReconstructionProgress) -> Void) throws {
         // An orphaned subprocess from a previous run (app crashed, was
         // force-quit, or updated mid-reconstruction) doesn't die with its
@@ -149,7 +152,7 @@ final class MultiImageReconstructor {
             "feature_extractor",
             "--database_path", databaseURL.path,
             "--image_path", imagesDir.path,
-            "--ImageReader.single_camera", "1",
+            "--ImageReader.single_camera", sharedCamera ? "1" : "0",
             extractGPU, "0",
         ]) { line in
             guard let caps = Self.captures(#"Processed file \[(\d+)/(\d+)\]"#, in: line),

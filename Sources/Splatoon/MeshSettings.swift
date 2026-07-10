@@ -54,6 +54,11 @@ final class MeshSettings: ObservableObject {
     @Published var useMultiImageReconstruction: Bool {
         didSet { defaults.set(useMultiImageReconstruction, forKey: Keys.useMultiImageReconstruction) }
     }
+    /// How same-place assets are grouped into a scene: same place and time (safe
+    /// default), or same place across any day (needs GPS).
+    @Published var sceneMatchMode: SceneGrouping.MatchMode {
+        didSet { defaults.set(sceneMatchMode.rawValue, forKey: Keys.sceneMatchMode) }
+    }
     /// Training steps for the multi-image (COLMAP + OpenSplat) trainer. Too few
     /// and densification never fires (see OpenSplat's warmup-length, 500 steps);
     /// quality keeps improving well past 15000. Higher = longer wait.
@@ -110,6 +115,7 @@ final class MeshSettings: ObservableObject {
     private let defaults = UserDefaults.standard
     private enum Keys {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
+        static let sceneMatchMode = "reconstruction.sceneMatchMode"
         static let multiImageIterations = "reconstruction.multiImageIterations"
         static let singleImageMethod = "mesh.singleImageMethod"
         static let sceneMethod = "mesh.sceneMethod"
@@ -123,6 +129,8 @@ final class MeshSettings: ObservableObject {
 
     init() {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
+        sceneMatchMode = SceneGrouping.MatchMode(rawValue: defaults.string(forKey: Keys.sceneMatchMode) ?? "")
+            ?? .timeAndLocation
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
         sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .density

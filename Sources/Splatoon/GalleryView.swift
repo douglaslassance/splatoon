@@ -16,7 +16,8 @@ struct GalleryView: View {
                                   hasSplat: model.hasSplat(asset))
                         .onTapGesture(count: 2) {
                             model.open(asset, allowMultiImage: settings.useMultiImageReconstruction,
-                                      multiImageIterations: Int(settings.multiImageIterations))
+                                      multiImageIterations: Int(settings.multiImageIterations),
+                                      matchMode: settings.sceneMatchMode)
                         }
                         .help("Double-click to open its 3D splat")
                 }

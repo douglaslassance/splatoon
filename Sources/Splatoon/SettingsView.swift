@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The app Settings panel (⌘,), split into tabs so each fits without scrolling:
-/// single-image (SHARP) meshing, and multi-image (scene) reconstruction + meshing.
+/// single-image (SHARP) meshing, and multi-input (scene) reconstruction + meshing.
 struct SettingsView: View {
     @ObservedObject var settings: MeshSettings
 
@@ -10,7 +10,7 @@ struct SettingsView: View {
             singleImageTab
                 .tabItem { Label("Single Image", systemImage: "photo") }
             multiImageTab
-                .tabItem { Label("Multi-Image", systemImage: "square.stack.3d.up") }
+                .tabItem { Label("Multi-Input", systemImage: "square.stack.3d.up") }
         }
         .frame(width: 480)
         .padding(20)
@@ -41,11 +41,29 @@ struct SettingsView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Reconstruct multi-image scenes", isOn: $settings.useMultiImageReconstruction)
-                    Text("When a photo has several same-place/time siblings, or you open a video, "
-                         + "reconstruct a multi-view splat (COLMAP + OpenSplat) instead of a single-image one.")
+                    Toggle("Reconstruct multi-input scenes", isOn: $settings.useMultiImageReconstruction)
+                    Text("When several photos or videos capture the same place (or you open one video), "
+                         + "reconstruct a multi-view splat (COLMAP + OpenSplat) instead of a single-image one. "
+                         + "Blurry and badly-exposed frames are dropped automatically.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Group by", selection: $settings.sceneMatchMode) {
+                        ForEach(SceneGrouping.MatchMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    Text("“Time and location” groups shots taken close together in the same place. "
+                         + "“Location only” groups everything shot at that place, even on different days "
+                         + "(needs location data on the photos).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(!settings.useMultiImageReconstruction)
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
                 sliderRow(title: "Training steps",
                           valueText: "\(Int(settings.multiImageIterations)) (~\(estimatedMinutes) min)",
                           value: $settings.multiImageIterations, range: 1000...30000, step: 500,
@@ -56,8 +74,8 @@ struct SettingsView: View {
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
 
                 Label {
-                    Text("For best results use a **video**, or many overlapping photos in a slow continuous "
-                         + "orbit — spread-out angles won't align.")
+                    Text("For best results use a **video** (or several), or many overlapping photos in a slow "
+                         + "continuous orbit. Spread-out angles won't align.")
                         .font(.caption).foregroundStyle(.secondary)
                 } icon: {
                     Image(systemName: "video").foregroundStyle(.secondary)

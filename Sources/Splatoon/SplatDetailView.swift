@@ -84,7 +84,8 @@ struct SplatDetailView: View {
             Spacer()
 
             Button {
-                model.regenerateOpened(iterations: Int(settings.multiImageIterations))
+                model.regenerateOpened(iterations: Int(settings.multiImageIterations),
+                                       matchMode: settings.sceneMatchMode)
             } label: {
                 Label("Regenerate", systemImage: "arrow.clockwise")
             }

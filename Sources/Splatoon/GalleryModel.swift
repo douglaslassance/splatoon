@@ -142,30 +142,30 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Open / generate
 
-    /// Open an asset. A **video** is reconstructed as a multi-view scene from
-    /// frames sampled across it (dense, overlapping frames are ideal SfM input).
-    /// A **photo** with enough same-place/time siblings likewise reconstructs as
-    /// a scene; a lone photo goes through single-image SHARP. Scenes are gated by
-    /// `allowMultiImage` (the "Reconstruct multi-image scenes" setting).
-    func open(_ asset: PHAsset, allowMultiImage: Bool = true, multiImageIterations: Int = 15000) {
+    /// Open an asset. Same-place photos and videos (per `matchMode`) reconstruct
+    /// together as a multi-view scene: a video yields many overlapping frames on
+    /// its own, and stills and clips can mix in one scene. A lone photo with no
+    /// siblings goes through single-image SHARP. Scenes are gated by
+    /// `allowMultiImage` (the "Reconstruct multi-input scenes" setting).
+    func open(_ asset: PHAsset, allowMultiImage: Bool = true, multiImageIterations: Int = 15000,
+              matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
         errorMessage = nil
         resetOpenedMesh()
 
-        if asset.mediaType == .video {
-            guard allowMultiImage else {
-                errorMessage = "Turn on “Reconstruct multi-image scenes” in Settings (⌘,) to build a splat from a video."
-                return
-            }
-            openVideoScene(asset, iterations: multiImageIterations)
-            return
-        }
-
         if allowMultiImage {
-            let group = SceneGrouping.neighbors(of: asset, in: assets)
+            let group = SceneGrouping.neighbors(of: asset, in: assets, matchMode: matchMode)
             if SceneGrouping.isScene(group) {
                 openScene(group, hero: asset, iterations: multiImageIterations)
                 return
             }
+        }
+
+        // Only a lone photo falls through to single-image SHARP. A video that
+        // isn't a scene means multi-input is off, so it has no single-image path
+        // here (its SHARP fallback runs on the sharpest frame, on demand).
+        if asset.mediaType == .video {
+            errorMessage = "Turn on “Reconstruct multi-input scenes” in Settings (⌘,) to build a splat from a video."
+            return
         }
 
         let identifier = asset.localIdentifier
@@ -293,7 +293,7 @@ final class GalleryModel: ObservableObject {
 
     /// Discard the opened splat's cached files and rebuild it from the original
     /// source (photo, photo group, or video). Uses the current settings.
-    func regenerateOpened(iterations: Int) {
+    func regenerateOpened(iterations: Int, matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
         guard let opened, let asset = sourceForOpened[opened.id] else { return }
         let wasScene = opened.isScene
 
@@ -308,7 +308,7 @@ final class GalleryModel: ObservableObject {
         if asset.mediaType == .video && !wasScene {
             openVideoSingleFrame(asset)                                   // the video's SHARP fallback
         } else {
-            open(asset, allowMultiImage: wasScene, multiImageIterations: iterations)
+            open(asset, allowMultiImage: wasScene, multiImageIterations: iterations, matchMode: matchMode)
         }
     }
 
@@ -339,39 +339,37 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Multi-image scene reconstruction
 
-    /// Reconstruct a splat from several photos of the same scene, caching the
-    /// result like a single-image splat.
-    private func openScene(_ group: [PHAsset], hero: PHAsset, iterations: Int) {
+    /// Reconstruct a splat from one or more same-place sources (photos and/or
+    /// videos), caching the result like a single-image splat. Photos contribute
+    /// one frame each; videos are frame-sampled. All frames are quality-scored and
+    /// culled before COLMAP sees them (see `selectAndWriteFrames`).
+    private func openScene(_ sources: [PHAsset], hero: PHAsset, iterations: Int) {
         // Iteration count is part of the cache key so raising it in Settings and
         // reopening actually retrains, instead of silently reusing a blurrier cache.
-        let key = SceneGrouping.sceneKey(for: group) + "-i\(iterations)"
+        let key = SceneGrouping.sceneKey(for: sources) + "-i\(iterations)"
         sourceForOpened[key] = hero
-        startSceneReconstruction(key: key, title: "Scene · \(group.count) photos",
-                                 iterations: iterations, hero: hero) { imagesDir, report in
-            var written = 0
-            for (index, asset) in group.enumerated() {
-                if await self.exportSceneImage(asset, to: imagesDir, index: index) { written += 1 }
-                report("Preparing \(group.count) photos…", Double(index + 1) / Double(group.count))
-            }
-            return written
+        // A shared camera intrinsic is a strong prior when every frame comes from
+        // one capture (a single video, or a photo group from one phone). Mixed or
+        // multi-clip scenes span cameras, so let COLMAP solve intrinsics per image.
+        let videoCount = sources.filter { $0.mediaType == .video }.count
+        let sharedCamera = videoCount == 0 || (videoCount == 1 && sources.count == 1)
+        startSceneReconstruction(key: key, title: Self.sceneTitle(for: sources),
+                                 iterations: iterations, hero: hero, sharedCamera: sharedCamera) { imagesDir, report in
+            await self.selectAndWriteFrames(from: sources, to: imagesDir, report: report)
         }
     }
 
-    /// Reconstruct a splat from a single video, sampling frames across it — dense,
-    /// overlapping frames are ideal SfM input, sidestepping the sparse-photo
-    /// registration failures.
-    private func openVideoScene(_ asset: PHAsset, iterations: Int) {
-        let key = "video-" + SceneGrouping.stableHash(asset.localIdentifier) + "-i\(iterations)"
-        sourceForOpened[key] = asset
-        startSceneReconstruction(key: key, title: "Video scene", iterations: iterations, hero: asset) { imagesDir, report in
-            await self.extractVideoFrames(from: asset, to: imagesDir) { done, total in
-                report("Extracting \(total) frames…", Double(done) / Double(max(total, 1)))
-            }
-        }
+    /// A human title for a scene built from `sources`.
+    private static func sceneTitle(for sources: [PHAsset]) -> String {
+        let videos = sources.filter { $0.mediaType == .video }.count
+        let photos = sources.count - videos
+        if videos == 0 { return "Scene · \(photos) photos" }
+        if photos == 0 { return videos == 1 ? "Video scene" : "Video scene · \(videos) clips" }
+        return "Scene · \(photos) photo\(photos == 1 ? "" : "s") + \(videos) video\(videos == 1 ? "" : "s")"
     }
 
     /// Recover from a failed scene by running single-image SHARP on the asset the
-    /// user tapped (its middle frame, for a video). Driven by the failure alert.
+    /// user tapped (its sharpest frame, for a video). Driven by the failure alert.
     func fallbackToSingleImage() {
         guard let failure = sceneFailure else { return }
         let asset = failure.asset
@@ -383,7 +381,7 @@ final class GalleryModel: ObservableObject {
         }
     }
 
-    /// SHARP on a video's middle frame — the single-image fallback for a video.
+    /// SHARP on a video's sharpest frame, the single-image fallback for a video.
     private func openVideoSingleFrame(_ asset: PHAsset) {
         resetOpenedMesh()
         let identifier = asset.localIdentifier
@@ -404,30 +402,14 @@ final class GalleryModel: ObservableObject {
         sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Extracting frame…",
                                       fraction: 0.05, isScene: false, cancellable: false)
         Task { @MainActor in
-            guard let cgImage = await self.middleVideoFrame(from: asset) else {
+            guard let avAsset = await self.avAsset(for: asset),
+                  let cgImage = await Self.sharpestFrame(from: avAsset) else {
                 self.failGeneration(key: identifier, message: "Could not read a frame from the video.")
                 return
             }
             self.generate(cgImage: cgImage, identifier: identifier, title: title,
                           modelURL: modelURL, destination: destination)
         }
-    }
-
-    /// Decode the frame at the midpoint of a Photos video, orientation baked in.
-    private func middleVideoFrame(from asset: PHAsset) async -> CGImage? {
-        let avAsset: AVAsset? = await withCheckedContinuation { continuation in
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            imageManager.requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-                continuation.resume(returning: avAsset)
-            }
-        }
-        guard let avAsset, let duration = try? await avAsset.load(.duration) else { return nil }
-        let generator = AVAssetImageGenerator(asset: avAsset)
-        generator.appliesPreferredTrackTransform = true
-        let mid = CMTime(seconds: CMTimeGetSeconds(duration) / 2, preferredTimescale: 600)
-        return try? await generator.image(at: mid).image
     }
 
     /// Shared reconstruction driver used by both photo-group and video scenes.
@@ -437,7 +419,7 @@ final class GalleryModel: ObservableObject {
     /// error handling — is identical. Runs in the background regardless of
     /// navigation; `sceneProgress` tracks it independently of `opened`.
     private func startSceneReconstruction(
-        key: String, title: String, iterations: Int, hero: PHAsset,
+        key: String, title: String, iterations: Int, hero: PHAsset, sharedCamera: Bool = true,
         prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
     ) {
         let destination = splatURL(for: key)
@@ -489,7 +471,7 @@ final class GalleryModel: ObservableObject {
 
                 // COLMAP + training: the remaining 95%.
                 try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination,
-                                      totalImages: written) { update in
+                                      totalImages: written, sharedCamera: sharedCamera) { update in
                     Task { @MainActor in
                         guard self.sceneProgress?.key == key else { return }
                         self.sceneProgress?.stageLabel = update.stageLabel
@@ -528,11 +510,46 @@ final class GalleryModel: ObservableObject {
         }
     }
 
-    /// Resolve the Photos video to an AVAsset and sample frames from it (see
-    /// `extractFrames`).
-    private func extractVideoFrames(from asset: PHAsset, to dir: URL,
-                                    progress: @escaping (Int, Int) -> Void) async -> Int {
-        let avAsset: AVAsset? = await withCheckedContinuation { continuation in
+    // MARK: - Frame selection
+
+    /// Turn a mix of photo and video sources into a culled, budgeted set of
+    /// COLMAP-ready JPEGs. Videos are frame-sampled and share a global budget so
+    /// several clips don't blow up matching; every candidate is quality-scored and
+    /// blurred or badly-exposed frames are dropped. Returns the count written.
+    private func selectAndWriteFrames(from sources: [PHAsset], to dir: URL,
+                                      report: @escaping (String, Double) -> Void) async -> Int {
+        let videoCount = sources.filter { $0.mediaType == .video }.count
+        let perVideoBudget = videoCount > 0
+            ? max(FrameSelection.minFramesPerVideo,
+                  min(FrameSelection.maxFramesPerVideo, FrameSelection.totalFrameBudget / videoCount))
+            : 0
+        let noun = sources.count == 1 ? "source" : "sources"
+
+        var written = 0
+        for (sIndex, source) in sources.enumerated() {
+            var frames: [CGImage] = []
+            if source.mediaType == .video {
+                if let av = await avAsset(for: source) {
+                    frames = await Self.selectVideoFrames(from: av, budget: perVideoBudget)
+                }
+            } else if let image = await loadPhoto(source),
+                      FrameSelection.exposureUsable(FrameSelection.exposure(of: image)) {
+                // A photo is deliberate, so keep it unless it's near-black/blown.
+                frames = [image]
+            }
+            for image in frames {
+                let url = dir.appendingPathComponent(String(format: "src%02d_%04d.jpg", sIndex, written))
+                if Self.writeJPEG(image, to: url) { written += 1 }
+            }
+            report("Selecting frames from \(sources.count) \(noun)…",
+                   Double(sIndex + 1) / Double(sources.count))
+        }
+        return written
+    }
+
+    /// Resolve a Photos video to an AVAsset.
+    private func avAsset(for asset: PHAsset) async -> AVAsset? {
+        await withCheckedContinuation { continuation in
             let options = PHVideoRequestOptions()
             options.isNetworkAccessAllowed = true
             options.deliveryMode = .highQualityFormat
@@ -540,29 +557,107 @@ final class GalleryModel: ObservableObject {
                 continuation.resume(returning: avAsset)
             }
         }
-        guard let avAsset else { return 0 }
-        return await Self.extractFrames(from: avAsset, to: dir, progress: progress)
     }
 
-    /// Sample evenly-spaced frames from a video into `dir` as JPEGs (orientation
-    /// baked in, downscaled for speed). ~3 fps, clamped 15…48 frames — dense
-    /// enough to register reliably without O(n²) matching exploding. Returns the
-    /// count written; `progress(done, total)` reports extraction progress.
-    /// `nonisolated static` so the headless `--selftest-video` hook can drive the
-    /// exact same sampling from a file URL, without PhotoKit.
+    /// Decode a Photos still, orientation baked in so COLMAP reads it upright.
+    private func loadPhoto(_ asset: PHAsset) async -> CGImage? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            options.isSynchronous = false
+            imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                continuation.resume(returning: data.flatMap(Self.decodeOriented))
+            }
+        }
+    }
+
+    /// Sample a video, drop the blurriest and badly-exposed frames, and return up
+    /// to `budget` well-exposed frames evenly spread across time (temporal spread
+    /// matters more to SfM than picking only the single sharpest moments). A cheap
+    /// low-res pass scores; the chosen times are re-rendered at full resolution.
+    nonisolated static func selectVideoFrames(from avAsset: AVAsset, budget: Int) async -> [CGImage] {
+        guard budget > 0, let duration = try? await avAsset.load(.duration) else { return [] }
+        let seconds = CMTimeGetSeconds(duration)
+        guard seconds.isFinite, seconds > 0 else { return [] }
+        let fpsSamples = Int((seconds * FrameSelection.sampleFPS).rounded())
+        let sampleCount = min(FrameSelection.maxVideoSamples, max(budget, fpsSamples))
+
+        // Pass 1: cheap low-res scoring to find sharp, well-exposed times.
+        let scorer = makeGenerator(avAsset, maxDimension: 480)
+        var scored: [(t: Double, sharpness: Double)] = []
+        for i in 0..<sampleCount {
+            let t = seconds * (Double(i) + 0.5) / Double(sampleCount)
+            guard let img = try? await scorer.image(at: CMTime(seconds: t, preferredTimescale: 600)).image,
+                  FrameSelection.exposureUsable(FrameSelection.exposure(of: img)) else { continue }
+            scored.append((t, FrameSelection.sharpness(of: img)))
+        }
+        guard !scored.isEmpty else { return [] }
+
+        // Drop frames below a fraction of this clip's median sharpness…
+        let median = scored.map(\.sharpness).sorted()[scored.count / 2]
+        let ordered = scored.filter { $0.sharpness >= median * FrameSelection.relativeSharpnessFloor }
+                            .sorted { $0.t < $1.t }
+        // …then evenly subsample the survivors to the budget, preserving spread.
+        var times: [Double] = []
+        if ordered.count <= budget {
+            times = ordered.map(\.t)
+        } else {
+            let count = Double(ordered.count)
+            let slots = Double(budget)
+            for k in 0..<budget {
+                let position: Double = (Double(k) + 0.5) * count / slots
+                let idx = min(Int(position), ordered.count - 1)
+                times.append(ordered[idx].t)
+            }
+        }
+
+        // Pass 2: render the chosen times at full working resolution for COLMAP.
+        let full = makeGenerator(avAsset, maxDimension: 1920)
+        var frames: [CGImage] = []
+        for t in times {
+            if let img = try? await full.image(at: CMTime(seconds: t, preferredTimescale: 600)).image {
+                frames.append(img)
+            }
+        }
+        return frames
+    }
+
+    /// The single sharpest, well-exposed frame of a video, the single-image
+    /// fallback's source. Falls back to the midpoint if nothing scores.
+    nonisolated static func sharpestFrame(from avAsset: AVAsset) async -> CGImage? {
+        guard let duration = try? await avAsset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let fpsSamples = Int((seconds * FrameSelection.sampleFPS).rounded())
+        let sampleCount = min(FrameSelection.maxVideoSamples, max(12, fpsSamples))
+
+        let scorer = makeGenerator(avAsset, maxDimension: 480)
+        var best: (t: Double, sharpness: Double)?
+        for i in 0..<sampleCount {
+            let t = seconds * (Double(i) + 0.5) / Double(sampleCount)
+            guard let img = try? await scorer.image(at: CMTime(seconds: t, preferredTimescale: 600)).image,
+                  FrameSelection.exposureUsable(FrameSelection.exposure(of: img)) else { continue }
+            let s = FrameSelection.sharpness(of: img)
+            if best == nil || s > best!.sharpness { best = (t, s) }
+        }
+        let full = makeGenerator(avAsset, maxDimension: 1920)
+        let time = best?.t ?? seconds / 2
+        return try? await full.image(at: CMTime(seconds: time, preferredTimescale: 600)).image
+    }
+
+    /// Sample evenly-spaced frames from a video into `dir` as JPEGs (no scoring).
+    /// Kept for the headless `--selftest-video` hook, which drives sampling from a
+    /// file URL without PhotoKit; the interactive path uses `selectVideoFrames`.
     nonisolated static func extractFrames(from avAsset: AVAsset, to dir: URL,
                                           progress: @escaping (Int, Int) -> Void) async -> Int {
         guard let duration = try? await avAsset.load(.duration) else { return 0 }
         let seconds = CMTimeGetSeconds(duration)
         guard seconds.isFinite, seconds > 0 else { return 0 }
 
-        let count = min(48, max(15, Int(seconds * 3)))
-        let generator = AVAssetImageGenerator(asset: avAsset)
-        generator.appliesPreferredTrackTransform = true            // bake in orientation
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        generator.maximumSize = CGSize(width: 1920, height: 1920)  // downscale for speed
-
+        let fpsSamples = Int(seconds * FrameSelection.sampleFPS)
+        let count = min(FrameSelection.maxFramesPerVideo, max(FrameSelection.minFramesPerVideo, fpsSamples))
+        let generator = makeGenerator(avAsset, maxDimension: 1920)
         var written = 0
         for i in 0..<count {
             let t = seconds * (Double(i) + 0.5) / Double(count)
@@ -575,23 +670,15 @@ final class GalleryModel: ObservableObject {
         return written
     }
 
-    /// Export one Photos asset to a JPEG in `dir`, orientation baked in so COLMAP
-    /// reads it upright. Returns whether the write succeeded.
-    private func exportSceneImage(_ asset: PHAsset, to dir: URL, index: Int) async -> Bool {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            options.isSynchronous = false
-            imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
-                guard let data, let cgImage = Self.decodeOriented(data) else {
-                    continuation.resume(returning: false)
-                    return
-                }
-                let url = dir.appendingPathComponent(String(format: "img_%04d.jpg", index))
-                continuation.resume(returning: Self.writeJPEG(cgImage, to: url))
-            }
-        }
+    /// A frame generator that bakes in orientation, hits exact times, and caps the
+    /// output size for speed/memory.
+    private nonisolated static func makeGenerator(_ avAsset: AVAsset, maxDimension: CGFloat) -> AVAssetImageGenerator {
+        let generator = AVAssetImageGenerator(asset: avAsset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        generator.maximumSize = CGSize(width: maxDimension, height: maxDimension)
+        return generator
     }
 
     private nonisolated static func writeJPEG(_ image: CGImage, to url: URL) -> Bool {
