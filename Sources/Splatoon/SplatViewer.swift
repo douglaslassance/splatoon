@@ -148,8 +148,11 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     /// so a splat opens framed like its source photo.
     private var fovy: Float { (initialPose?.fovyDegrees ?? sharpFOVyDegrees) * .pi / 180 }
     private let lookSensitivity: Float = 0.005
-    private let moveSpeed: Float = 8      // world units per second
-    private let panSensitivity: Float = 8 * 0.002   // world units per pixel dragged
+    // Navigation speeds scale to the loaded splat's size (calibrateSpeeds), using
+    // the SAME formulas as MeshViewer so Splat↔Mesh move at a matching rate.
+    private var moveSpeed: Float = 8        // world units per second
+    private var dollyScale: Float = 0.05    // world units per scroll unit
+    private var panSensitivity: Float = 0.016   // world units per pixel dragged
 
     // ANSI key codes (physical positions, layout-independent).
     private enum Key {
@@ -172,7 +175,29 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     }
 
     func dolly(_ amount: Float) {
-        eye += forwardVector * (amount * 0.05)
+        eye += forwardVector * (amount * dollyScale)
+    }
+
+    /// Scale fly-camera speeds to the splat's world size so movement feels the same
+    /// as the mesh view. Mirrors MeshViewer: bounding-box radius × the same factors,
+    /// but over an inlier set (drop the farthest ~2% — SHARP clouds trail off beyond
+    /// the frame, which the mesher clips too) so outliers don't inflate the speed.
+    private func calibrateSpeeds(to points: [SplatPoint]) {
+        guard points.count > 8 else { return }
+        var sum = SIMD3<Float>(0, 0, 0)
+        for p in points { sum += p.position }
+        let centroid = sum / Float(points.count)
+        let sortedSq = points.map { simd_length_squared($0.position - centroid) }.sorted()
+        let cutoff = sortedSq[Int(Float(sortedSq.count) * 0.98)]
+        var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for p in points where simd_length_squared(p.position - centroid) <= cutoff {
+            mn = simd_min(mn, p.position); mx = simd_max(mx, p.position)
+        }
+        let radius = max(simd_length(mx - (mn + mx) / 2), 1e-3)
+        moveSpeed = radius * 1.5
+        dollyScale = radius * 0.01
+        panSensitivity = moveSpeed * 0.002
     }
 
     /// Translate the camera along its screen-space right/up axes, right-drag —
@@ -253,6 +278,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
                 )
                 let reader = try AutodetectSceneReader(url)
                 let points = try await reader.readAll()
+                calibrateSpeeds(to: points)
                 let chunk = try SplatChunk(device: device, from: points)
                 _ = await newRenderer.addChunk(chunk)
                 // A newer load superseded this one; let it own the loading state.
