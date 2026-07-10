@@ -2,6 +2,8 @@ import SwiftUI
 
 /// The available mesh-generation strategies, shown in the Settings panel.
 enum MeshMethod: String, CaseIterable, Identifiable {
+    /// Anisotropic Gaussian density field -> iso-surface (marching tetrahedra).
+    case density
     /// Connect the Gaussian pixel grid into a 2.5D relief surface.
     case grid
     /// One oriented quad ("surfel") per Gaussian, sized and oriented by its shape.
@@ -13,11 +15,13 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     /// Methods offered for multi-view scene splats. Grid needs SHARP's structured
     /// pixel grid, which scene (COLMAP + OpenSplat) splats don't have, so it's
-    /// excluded here.
-    static let sceneCases: [MeshMethod] = [.surfel, .poisson]
+    /// excluded here. Density leads: it needs no normals, so it holds up best on
+    /// unstructured multi-view splats.
+    static let sceneCases: [MeshMethod] = [.density, .surfel, .poisson]
 
     var displayName: String {
         switch self {
+        case .density: return "Anisotropic density"
         case .grid: return "Grid surface"
         case .surfel: return "Surfels (per-splat quads)"
         case .poisson: return "Poisson reconstruction"
@@ -26,6 +30,9 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
+        case .density:
+            return "Builds a density field from each splat's shape and extracts a smooth iso-surface. "
+                + "Uses no normals, so it's the most reliable on multi-image scenes."
         case .grid:
             return "Connects the splat's pixel grid into a single 2.5D surface. Fast, on-device."
         case .surfel:
@@ -74,9 +81,18 @@ final class MeshSettings: ObservableObject {
     @Published var surfelExtent: Double {
         didSet { defaults.set(surfelExtent, forKey: Keys.surfelExtent) }
     }
-    /// Poisson: voxel grid resolution along the longest axis.
+    /// Poisson / Density: voxel grid resolution along the longest axis.
     @Published var poissonResolution: Double {
         didSet { defaults.set(poissonResolution, forKey: Keys.poissonResolution) }
+    }
+    /// Density: how tightly the iso-surface hugs the splats (0 = loose/inflated,
+    /// 1 = tight to dense cores). Maps to the iso density level.
+    @Published var surfaceTightness: Double {
+        didSet { defaults.set(surfaceTightness, forKey: Keys.surfaceTightness) }
+    }
+    /// Density: shifts the surface outward (>0, inflate) or inward (<0).
+    @Published var densityOffset: Double {
+        didSet { defaults.set(densityOffset, forKey: Keys.densityOffset) }
     }
 
     /// The mesh method for the given splat kind.
@@ -87,7 +103,8 @@ final class MeshSettings: ObservableObject {
     /// Changes whenever a meshing setting relevant to `isScene` changes; used to
     /// key the in-app mesh preview cache so it rebuilds when the user tweaks it.
     func signature(forScene isScene: Bool) -> String {
-        "\(method(forScene: isScene).rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)|\(poissonResolution)"
+        "\(method(forScene: isScene).rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)"
+            + "|\(poissonResolution)|\(surfaceTightness)|\(densityOffset)"
     }
 
     private let defaults = UserDefaults.standard
@@ -100,16 +117,20 @@ final class MeshSettings: ObservableObject {
         static let depthRatioCull = "mesh.depthRatioCull"
         static let surfelExtent = "mesh.surfelExtent"
         static let poissonResolution = "mesh.poissonResolution"
+        static let surfaceTightness = "mesh.surfaceTightness"
+        static let densityOffset = "mesh.densityOffset"
     }
 
     init() {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
-        sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .poisson
+        sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .density
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false
         depthRatioCull = defaults.object(forKey: Keys.depthRatioCull) as? Double ?? 1.5
         surfelExtent = defaults.object(forKey: Keys.surfelExtent) as? Double ?? 2.0
         poissonResolution = defaults.object(forKey: Keys.poissonResolution) as? Double ?? 384
+        surfaceTightness = defaults.object(forKey: Keys.surfaceTightness) as? Double ?? 0.5
+        densityOffset = defaults.object(forKey: Keys.densityOffset) as? Double ?? 0.0
     }
 }

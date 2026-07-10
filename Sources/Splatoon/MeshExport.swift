@@ -35,10 +35,14 @@ enum MeshExporter {
                         depthRatioCull: Float = 1.5,
                         surfelExtent: Float = 2.0,
                         poissonResolution: Int = 256,
+                        surfaceTightness: Float = 0.5,
+                        densityOffset: Float = 0.0,
                         opacityThreshold: Float = 0.05) throws {
         let mesh = buildMesh(gaussians: gaussians, method: method, smoothGrid: smoothGrid,
                              depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
-                             poissonResolution: poissonResolution, opacityThreshold: opacityThreshold)
+                             poissonResolution: poissonResolution,
+                             surfaceTightness: surfaceTightness, densityOffset: densityOffset,
+                             opacityThreshold: opacityThreshold)
         try writeGLB(positions: mesh.positions, normals: mesh.normals, colors: mesh.colors,
                      indices: mesh.indices.isEmpty ? nil : mesh.indices, to: outputURL)
     }
@@ -51,6 +55,8 @@ enum MeshExporter {
                           depthRatioCull: Float = 1.5,
                           surfelExtent: Float = 2.0,
                           poissonResolution: Int = 256,
+                          surfaceTightness: Float = 0.5,
+                          densityOffset: Float = 0.0,
                           opacityThreshold: Float = 0.05) -> Mesh {
 
         let n = gaussians.count
@@ -98,6 +104,18 @@ enum MeshExporter {
             return len > 1e-6 ? nrm / len : SIMD3(0, 0, 1)
         }
         func valid(_ i: Int) -> Bool { opacityPtr[i] > opacityThreshold }
+        /// The three orthonormal local axes (in glTF space) of splat `i`.
+        func axisVectors(_ i: Int) -> (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>) {
+            let q = quat(i)
+            return (flip(quatRotate(q, SIMD3(1, 0, 0))),
+                    flip(quatRotate(q, SIMD3(0, 1, 0))),
+                    flip(quatRotate(q, SIMD3(0, 0, 1))))
+        }
+        /// Per-axis Gaussian scale (standard deviation) of splat `i`.
+        func scales(_ i: Int) -> SIMD3<Float> {
+            SIMD3(scalePtr[i * 3 + 0], scalePtr[i * 3 + 1], scalePtr[i * 3 + 2])
+        }
+        func opacity(_ i: Int) -> Float { opacityPtr[i] }
 
         var positions: [SIMD3<Float>] = []
         var normals: [SIMD3<Float>] = []
@@ -137,6 +155,23 @@ enum MeshExporter {
                                  depth: rawDepth, valid: valid,
                                  positions: &positions, normals: &normals,
                                  colors: &colors, indices: &indices)
+            }
+
+        case .density:
+            buildDensitySurface(n: n, resolution: poissonResolution,
+                                tightness: surfaceTightness, offset: densityOffset,
+                                position: position, axisVectors: axisVectors, scales: scales,
+                                opacity: opacity, colorLinear: colorLinear,
+                                depth: rawDepth, valid: valid,
+                                positions: &positions, normals: &normals,
+                                colors: &colors, indices: &indices)
+            if positions.isEmpty {
+                // No surface at this iso level; fall back to the volumetric mesher.
+                buildVolumetricSurface(n: n, gridWidth: gridWidth, resolution: poissonResolution,
+                                       position: position, normal: normal, colorLinear: colorLinear,
+                                       depth: rawDepth, valid: valid,
+                                       positions: &positions, normals: &normals,
+                                       colors: &colors, indices: &indices)
             }
         }
 
@@ -399,10 +434,6 @@ enum MeshExporter {
         let maxRadius = 7
         var band = [Int64: BandVoxel](minimumCapacity: 1 << 20)
 
-        @inline(__always) func voxelKey(_ ix: Int, _ iy: Int, _ iz: Int) -> Int64 {
-            (Int64(ix) << 42) | (Int64(iy) << 21) | Int64(iz)
-        }
-
         for k in 0..<pts.count {
             let p = pts[k], nrm = nrms[k], c = cols[k]
             let reach = max(voxel * 1.5, lateralFactor * deps[k])
@@ -416,14 +447,142 @@ enum MeshExporter {
                         let sd = simd_dot(center - p, nrm)
                         // Thin slab perpendicular to the surface; the box gives lateral reach.
                         if abs(sd) <= trunc {
-                            band[voxelKey(ix, iy, iz), default: BandVoxel()].accumulate(sd, c)
+                            band[Self.voxelKey(ix, iy, iz), default: BandVoxel()].accumulate(sd, c)
                         }
                     }
                 }
             }
         }
         guard band.count > 8 else { return }
+        extractZeroSurface(band: band, voxel: voxel, origin: origin,
+                           positions: &positions, normals: &normals,
+                           colors: &colors, indices: &indices)
+    }
 
+    // MARK: - Anisotropic density reconstruction (marching tetrahedra)
+    //
+    // Accumulate each Gaussian's anisotropic density (opacity · exp(-½·Mahalanobis²))
+    // into a voxel grid, then extract an iso-density level-set. Unlike the TSDF path
+    // this needs NO per-point normal, so it stays robust on unstructured multi-view
+    // splats whose per-splat normals are unreliable. Mirrors SplatEdit's "Anisotropic
+    // density" proxy: Resolution (voxel grid), Surface Tightness (iso level), Offset.
+
+    private static func buildDensitySurface(
+        n: Int, resolution: Int, tightness: Float, offset: Float,
+        position: (Int) -> SIMD3<Float>,
+        axisVectors: (Int) -> (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>),
+        scales: (Int) -> SIMD3<Float>, opacity: (Int) -> Float,
+        colorLinear: (Int) -> SIMD3<Float>, depth: (Int) -> Float, valid: (Int) -> Bool,
+        positions: inout [SIMD3<Float>], normals: inout [SIMD3<Float>],
+        colors: inout [SIMD4<UInt8>], indices: inout [UInt32]
+    ) {
+        // 1. Subsample valid splats to a working set (bounds cost on dense clouds).
+        let maxSplats = 400_000
+        let step = max(1, n / maxSplats)
+        var used: [Int] = []
+        used.reserveCapacity(min(n, maxSplats))
+        for i in Swift.stride(from: 0, to: n, by: step) where valid(i) { used.append(i) }
+        guard used.count > 100 else { return }
+
+        // 2. Clip the far background so it doesn't coarsen the voxel size.
+        let sortedDepths = used.map { depth($0) }.sorted()
+        let medianDepth = sortedDepths[sortedDepths.count / 2]
+        let p90 = sortedDepths[min(sortedDepths.count - 1, Int(Double(sortedDepths.count) * 0.90))]
+        let zClip = min(p90, medianDepth * 4)
+        used = used.filter { depth($0) <= zClip }
+        guard used.count > 100 else { return }
+
+        // 3. Bounding box + uniform voxel size from the requested resolution.
+        var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for i in used { let p = position(i); mn = simd_min(mn, p); mx = simd_max(mx, p) }
+        let longest = max((mx - mn).x, max((mx - mn).y, (mx - mn).z))
+        guard longest > 1e-6 else { return }
+        let cappedRes = min(resolution, 1024)
+        let voxel = longest / Float(max(32, cappedRes))
+        let origin = mn - SIMD3<Float>(repeating: 4 * voxel)
+
+        // 4. Splat anisotropic density into a sparse voxel grid. Each splat covers
+        //    ~3σ; σ is floored at half a voxel so thin splats still register on the
+        //    grid instead of falling between samples.
+        let kSigma: Float = 3.0
+        let maxRadius = 6
+        let sigmaFloor = voxel * 0.5
+        struct DensityCell {
+            var density: Float = 0
+            var color = SIMD3<Float>(repeating: 0)
+            mutating func add(_ w: Float, _ c: SIMD3<Float>) { density += w; color += c * w }
+        }
+        var grid = [Int64: DensityCell](minimumCapacity: 1 << 20)
+
+        for i in used {
+            let p = position(i)
+            let (a0, a1, a2) = axisVectors(i)
+            let s = simd_max(scales(i), SIMD3<Float>(repeating: sigmaFloor))
+            let inv = SIMD3<Float>(1, 1, 1) / s
+            let alpha = min(max(opacity(i), 0), 1)
+            let reach = kSigma * max(s.x, max(s.y, s.z))
+            let radius = min(maxRadius, max(1, Int(ceil(reach / voxel))))
+            let c = colorLinear(i)
+            let f = (p - origin) / voxel
+            let cx = Int(f.x), cy = Int(f.y), cz = Int(f.z)
+            for iz in (cz - radius)...(cz + radius) {
+                for iy in (cy - radius)...(cy + radius) {
+                    for ix in (cx - radius)...(cx + radius) {
+                        let center = origin + (SIMD3(Float(ix), Float(iy), Float(iz)) + 0.5) * voxel
+                        let d = center - p
+                        // Mahalanobis² in the splat's orthonormal local frame.
+                        let u = SIMD3(simd_dot(d, a0), simd_dot(d, a1), simd_dot(d, a2)) * inv
+                        let m2 = simd_dot(u, u)
+                        if m2 > kSigma * kSigma { continue }
+                        grid[Self.voxelKey(ix, iy, iz), default: DensityCell()].add(alpha * expf(-0.5 * m2), c)
+                    }
+                }
+            }
+        }
+        guard grid.count > 8 else { return }
+
+        // 5. Iso level relative to the field: a high percentile is the reference
+        //    "solid" density; the surface sits at a fraction of it. Higher tightness
+        //    pulls the surface toward denser cores; offset nudges it out (>0) or in.
+        let densities = grid.values.map { $0.density }.sorted()
+        let ref = densities[min(densities.count - 1, Int(Double(densities.count) * 0.99))]
+        guard ref > 1e-6 else { return }
+        let t = min(max(tightness, 0), 1)
+        let isoFraction = 0.04 + (0.30 - 0.04) * t
+        let iso = ref * isoFraction * (1 - 0.5 * min(max(offset, -1), 1))
+
+        // 6. Convert to a signed field (iso − density: negative inside, positive
+        //    outside) with density-weighted colour, then extract the level-set.
+        var band = [Int64: BandVoxel](minimumCapacity: grid.count)
+        for (key, cell) in grid {
+            var v = BandVoxel()
+            v.tsdf = iso - cell.density
+            v.color = cell.density > 1e-6 ? cell.color / cell.density : SIMD3(repeating: 0)
+            v.weight = 1
+            band[key] = v
+        }
+        extractZeroSurface(band: band, voxel: voxel, origin: origin,
+                           positions: &positions, normals: &normals,
+                           colors: &colors, indices: &indices)
+    }
+
+    /// Bit-pack a non-negative voxel index (grid origin is below the point cloud,
+    /// so indices are ≥ 0) into a single key. Shared by all voxel meshers.
+    @inline(__always) static func voxelKey(_ ix: Int, _ iy: Int, _ iz: Int) -> Int64 {
+        (Int64(ix) << 42) | (Int64(iy) << 21) | Int64(iz)
+    }
+
+    /// Extract the zero level-set of the scalar field held in `band[*].tsdf` with
+    /// marching tetrahedra. Only cells whose 8 corners are all present are meshed,
+    /// so the surface hugs the data without hallucinating unobserved regions.
+    /// `outward` follows increasing field value, so a field that is negative inside
+    /// the surface and positive outside yields outward-facing normals.
+    private static func extractZeroSurface(
+        band: [Int64: BandVoxel], voxel: Float, origin: SIMD3<Float>,
+        positions: inout [SIMD3<Float>], normals: inout [SIMD3<Float>],
+        colors: inout [SIMD4<UInt8>], indices: inout [UInt32]
+    ) {
         // Assign dense ids for welding and O(1) corner lookup.
         let keys = Array(band.keys)
         var idOf = [Int64: Int](minimumCapacity: keys.count)
@@ -485,7 +644,7 @@ enum MeshExporter {
             var observed = true
             for j in 0..<8 {
                 let o = cornerOff[j]
-                guard let cid = idOf[voxelKey(bx + o.x, by + o.y, bz + o.z)] else {
+                guard let cid = idOf[Self.voxelKey(bx + o.x, by + o.y, bz + o.z)] else {
                     observed = false; break
                 }
                 let v = voxArr[cid]

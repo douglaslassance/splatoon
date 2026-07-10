@@ -27,7 +27,9 @@ struct SplatDetailView: View {
                                       smoothGrid: settings.smoothGrid,
                                       depthRatioCull: Float(settings.depthRatioCull),
                                       surfelExtent: Float(settings.surfelExtent),
-                                      poissonResolution: Int(settings.poissonResolution))
+                                      poissonResolution: Int(settings.poissonResolution),
+                                      surfaceTightness: Float(settings.surfaceTightness),
+                                      densityOffset: Float(settings.densityOffset))
             }
     }
 
@@ -122,7 +124,9 @@ struct SplatDetailView: View {
                              smoothGrid: settings.smoothGrid,
                              depthRatioCull: Float(settings.depthRatioCull),
                              surfelExtent: Float(settings.surfelExtent),
-                             poissonResolution: Int(settings.poissonResolution))
+                             poissonResolution: Int(settings.poissonResolution),
+                             surfaceTightness: Float(settings.surfaceTightness),
+                             densityOffset: Float(settings.densityOffset))
         }
     }
 

@@ -617,7 +617,9 @@ final class GalleryModel: ObservableObject {
                          smoothGrid: Bool,
                          depthRatioCull: Float,
                          surfelExtent: Float,
-                         poissonResolution: Int) {
+                         poissonResolution: Int,
+                         surfaceTightness: Float,
+                         densityOffset: Float) {
         guard let opened, let source = opened.url else { return }
         let key = "\(opened.id)|\(settingsSignature)"
         if openedMeshKey == key, openedMesh != nil { return }   // already current
@@ -634,7 +636,8 @@ final class GalleryModel: ObservableObject {
                 let gaussians = try SplatPLYReader.readGaussians(from: source)
                 let mesh = MeshExporter.buildMesh(gaussians: gaussians, method: method,
                                                   smoothGrid: smoothGrid, depthRatioCull: depthRatioCull,
-                                                  surfelExtent: surfelExtent, poissonResolution: poissonResolution)
+                                                  surfelExtent: surfelExtent, poissonResolution: poissonResolution,
+                                                  surfaceTightness: surfaceTightness, densityOffset: densityOffset)
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }  // superseded meanwhile
                     self.openedMesh = mesh
@@ -723,7 +726,9 @@ final class GalleryModel: ObservableObject {
                     smoothGrid: Bool,
                     depthRatioCull: Float,
                     surfelExtent: Float,
-                    poissonResolution: Int) {
+                    poissonResolution: Int,
+                    surfaceTightness: Float,
+                    densityOffset: Float) {
         guard let opened, let source = opened.url else { return }
         let panel = NSSavePanel()
         panel.title = "Export Mesh"
@@ -739,7 +744,8 @@ final class GalleryModel: ObservableObject {
                 try MeshExporter.saveGLB(gaussians: gaussians, to: destination,
                                          method: method, smoothGrid: smoothGrid,
                                          depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
-                                         poissonResolution: poissonResolution)
+                                         poissonResolution: poissonResolution,
+                                         surfaceTightness: surfaceTightness, densityOffset: densityOffset)
                 await MainActor.run { self.clearIndeterminate() }
             } catch {
                 await MainActor.run {

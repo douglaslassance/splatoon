@@ -95,6 +95,27 @@ struct SettingsView: View {
     @ViewBuilder
     private func optionsCard(for method: MeshMethod) -> some View {
         switch method {
+        case .density:
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    sliderRow(title: "Resolution",
+                              valueText: "\(Int(settings.poissonResolution))",
+                              value: $settings.poissonResolution, range: 128...4096, step: 128,
+                              caption: "Sets the voxel grid resolution. The higher the value, the finer the detail, at the cost of speed and file size. It is capped by the splat's own point density.")
+                    sliderRow(title: "Surface tightness",
+                              valueText: String(format: "%.2f", settings.surfaceTightness),
+                              value: $settings.surfaceTightness, range: 0...1,
+                              caption: "How tightly the surface hugs the splats. Higher pulls it toward the densest cores (thinner, more detail but more holes); lower gives a fuller, smoother shell.")
+                    sliderRow(title: "Offset",
+                              valueText: String(format: "%+.2f", settings.densityOffset),
+                              value: $settings.densityOffset, range: -1...1,
+                              caption: "Shifts the surface outward (positive, inflate) or inward (negative). Useful to close small gaps or trim overshoot.")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            } label: {
+                Text("Density options").font(.headline)
+            }
         case .grid:
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {
