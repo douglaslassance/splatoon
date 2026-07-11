@@ -53,6 +53,18 @@ echo "==> Cloning OpenSplat into $WORK"
 git clone --depth 1 https://github.com/pierotofy/OpenSplat "$WORK/OpenSplat"
 
 cd "$WORK/OpenSplat"
+
+# Load images serially. OpenSplat loads every camera's image in parallel, and
+# each thread creates a torch tensor — but PyTorch's MPS backend is not
+# thread-safe for concurrent allocation, so the parallel load SIGSEGVs during
+# setup with many images (reproduced with pytorch 2.12 on Apple Silicon; the
+# CPU backend is unaffected). Loading is a one-time setup cost, so serializing it
+# removes the crash while keeping training on the GPU.
+echo "==> Patching OpenSplat to load images serially (MPS thread-safety)"
+perl -0777 -pi -e 's/parallel_for\(inputData\.cameras\.begin\(\), inputData\.cameras\.end\(\), \[&downScaleFactor\]\(Camera &cam\)\{\s*cam\.loadImage\(downScaleFactor\);\s*\}\);/for (Camera \&cam : inputData.cameras) { cam.loadImage(downScaleFactor); }/s' opensplat.cpp
+grep -q "for (Camera &cam : inputData.cameras)" opensplat.cpp \
+  || { echo "error: OpenSplat image-load patch did not apply (upstream code changed?)." >&2; exit 1; }
+
 mkdir -p build && cd build
 echo "==> Configuring (Metal/MPS build)"
 cmake .. \
