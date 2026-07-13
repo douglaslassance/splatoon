@@ -161,7 +161,8 @@ final class GalleryModel: ObservableObject {
     /// its own, and stills and clips can mix in one scene. A lone photo with no
     /// siblings goes through single-image SHARP. Scenes are gated by
     /// `allowMultiImage` (the "Reconstruct multi-input scenes" setting).
-    func open(_ asset: PHAsset, allowMultiImage: Bool = true, multiImageIterations: Int = 15000,
+    func open(_ asset: PHAsset, allowMultiImage: Bool = true,
+              options: SceneOptions = SceneOptions(iterations: 15000, shDegree: 1, globalPoseSolver: false),
               matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
         errorMessage = nil
         resetOpenedMesh()
@@ -169,7 +170,7 @@ final class GalleryModel: ObservableObject {
         if allowMultiImage {
             let group = SceneGrouping.neighbors(of: asset, in: assets, matchMode: matchMode)
             if SceneGrouping.isScene(group) {
-                openScene(group, hero: asset, iterations: multiImageIterations)
+                openScene(group, hero: asset, options: options)
                 return
             }
         }
@@ -309,7 +310,7 @@ final class GalleryModel: ObservableObject {
 
     /// Discard the opened splat's cached files and rebuild it from the original
     /// source (photo, photo group, or video). Uses the current settings.
-    func regenerateOpened(iterations: Int, matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
+    func regenerateOpened(options: SceneOptions, matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
         guard let opened, let asset = sourceForOpened[opened.id] else { return }
         let wasScene = opened.isScene
 
@@ -324,7 +325,7 @@ final class GalleryModel: ObservableObject {
         if asset.mediaType == .video && !wasScene {
             openVideoSingleFrame(asset)                                   // the video's SHARP fallback
         } else {
-            open(asset, allowMultiImage: wasScene, multiImageIterations: iterations, matchMode: matchMode)
+            open(asset, allowMultiImage: wasScene, options: options, matchMode: matchMode)
         }
     }
 
@@ -359,10 +360,11 @@ final class GalleryModel: ObservableObject {
     /// videos), caching the result like a single-image splat. Photos contribute
     /// one frame each; videos are frame-sampled. All frames are quality-scored and
     /// culled before COLMAP sees them (see `selectAndWriteFrames`).
-    private func openScene(_ sources: [PHAsset], hero: PHAsset, iterations: Int) {
-        // Iteration count is part of the cache key so raising it in Settings and
-        // reopening actually retrains, instead of silently reusing a blurrier cache.
-        let key = SceneGrouping.sceneKey(for: sources) + "-i\(iterations)"
+    private func openScene(_ sources: [PHAsset], hero: PHAsset, options: SceneOptions) {
+        // The reconstruction knobs are part of the cache key so changing any of
+        // them in Settings and reopening actually retrains, instead of silently
+        // reusing a splat built with the old settings.
+        let key = SceneGrouping.sceneKey(for: sources) + options.cacheSuffix
         sourceForOpened[key] = hero
         // A shared camera intrinsic is a strong prior when every frame comes from
         // one capture (a single video, or a photo group from one phone). Mixed or
@@ -370,7 +372,7 @@ final class GalleryModel: ObservableObject {
         let videoCount = sources.filter { $0.mediaType == .video }.count
         let sharedCamera = videoCount == 0 || (videoCount == 1 && sources.count == 1)
         startSceneReconstruction(key: key, title: Self.sceneTitle(for: sources),
-                                 iterations: iterations, hero: hero, sharedCamera: sharedCamera) { imagesDir, report in
+                                 options: options, hero: hero, sharedCamera: sharedCamera) { imagesDir, report in
             await self.selectAndWriteFrames(from: sources, to: imagesDir, report: report)
         }
     }
@@ -436,7 +438,7 @@ final class GalleryModel: ObservableObject {
     /// error handling — is identical. Runs in the background regardless of
     /// navigation; `sceneProgress` tracks it independently of `opened`.
     private func startSceneReconstruction(
-        key: String, title: String, iterations: Int, hero: PHAsset, sharedCamera: Bool = true,
+        key: String, title: String, options: SceneOptions, hero: PHAsset, sharedCamera: Bool = true,
         prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
     ) {
         let destination = splatURL(for: key)
@@ -464,7 +466,11 @@ final class GalleryModel: ObservableObject {
         buildStartedAt[key] = Date()
 
         let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
-        reconstructor.trainingIterations = iterations
+        reconstructor.trainingIterations = options.iterations
+        reconstructor.shDegree = options.shDegree
+        // The global solver is COLMAP's own `global_mapper`, so no extra binary to
+        // resolve; the reconstructor probes support and falls back if unavailable.
+        reconstructor.useGlobalSolver = options.globalPoseSolver
         sceneReconstructor = reconstructor
 
         Task.detached(priority: .userInitiated) {

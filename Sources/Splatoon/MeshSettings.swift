@@ -44,6 +44,30 @@ enum MeshMethod: String, CaseIterable, Identifiable {
     }
 }
 
+/// The multi-image reconstruction knobs that change the output PLY, bundled so
+/// they thread through `open`/`regenerateOpened` together and fold into the
+/// splat's cache key as a unit (reopening after any change retrains instead of
+/// reusing a stale splat).
+struct SceneOptions: Equatable {
+    /// OpenSplat training steps. More = sharper, slower.
+    var iterations: Int
+    /// Spherical-harmonics degree OpenSplat trains, 1…3. Lower means far smaller
+    /// files and faster rendering at the cost of some view-dependent shading;
+    /// degree 1 is plenty for casual captures (degree 3 stores 45 colour
+    /// coefficients per splat, degree 1 only 9).
+    var shDegree: Int
+    /// Solve camera poses with COLMAP's global SfM (`global_mapper`) instead of
+    /// its incremental mapper. More robust on sparse, weakly-overlapping captures,
+    /// where the incremental mapper often registers only a fraction of the views.
+    var globalPoseSolver: Bool
+
+    /// Cache-key suffix. Every field changes the resulting PLY, so each belongs
+    /// here, matching the old `-i<iters>` key while adding the new knobs.
+    var cacheSuffix: String {
+        "-i\(iterations)-sh\(shDegree)" + (globalPoseSolver ? "-global" : "")
+    }
+}
+
 /// User-selectable mesh export settings, persisted across launches.
 @MainActor
 final class MeshSettings: ObservableObject {
@@ -64,6 +88,19 @@ final class MeshSettings: ObservableObject {
     /// quality keeps improving well past 15000. Higher = longer wait.
     @Published var multiImageIterations: Double {
         didSet { defaults.set(multiImageIterations, forKey: Keys.multiImageIterations) }
+    }
+    /// Spherical-harmonics degree the multi-view trainer uses (1…3). Defaults to
+    /// 1: casual captures gain little from higher-order view-dependent colour, and
+    /// each extra degree multiplies the per-splat colour storage (degree 3 splats
+    /// are several times larger on disk and slower to render).
+    @Published var sceneSHDegree: Int {
+        didSet { defaults.set(sceneSHDegree, forKey: Keys.sceneSHDegree) }
+    }
+    /// Solve poses with COLMAP's global SfM (`global_mapper`) instead of its
+    /// incremental mapper. More robust on sparse, weakly-overlapping captures.
+    /// Same COLMAP binary; falls back to the incremental mapper on older builds.
+    @Published var useGlobalPoseSolver: Bool {
+        didSet { defaults.set(useGlobalPoseSolver, forKey: Keys.useGlobalPoseSolver) }
     }
     /// Mesh method for single-image (SHARP) splats — any of the three.
     @Published var singleImageMethod: MeshMethod {
@@ -100,6 +137,13 @@ final class MeshSettings: ObservableObject {
         didSet { defaults.set(densityOffset, forKey: Keys.densityOffset) }
     }
 
+    /// The current multi-image reconstruction knobs as one value.
+    var sceneOptions: SceneOptions {
+        SceneOptions(iterations: Int(multiImageIterations),
+                     shDegree: sceneSHDegree,
+                     globalPoseSolver: useGlobalPoseSolver)
+    }
+
     /// The mesh method for the given splat kind.
     func method(forScene isScene: Bool) -> MeshMethod {
         isScene ? sceneMethod : singleImageMethod
@@ -117,6 +161,8 @@ final class MeshSettings: ObservableObject {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
         static let sceneMatchMode = "reconstruction.sceneMatchMode"
         static let multiImageIterations = "reconstruction.multiImageIterations"
+        static let sceneSHDegree = "reconstruction.sceneSHDegree"
+        static let useGlobalPoseSolver = "reconstruction.useGlobalPoseSolver"
         static let singleImageMethod = "mesh.singleImageMethod"
         static let sceneMethod = "mesh.sceneMethod"
         static let smoothGrid = "mesh.smoothGrid"
@@ -132,6 +178,8 @@ final class MeshSettings: ObservableObject {
         sceneMatchMode = SceneGrouping.MatchMode(rawValue: defaults.string(forKey: Keys.sceneMatchMode) ?? "")
             ?? .timeAndLocation
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
+        sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { min(3, max(1, $0)) } ?? 1
+        useGlobalPoseSolver = defaults.object(forKey: Keys.useGlobalPoseSolver) as? Bool ?? false
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
         sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .density
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false

@@ -27,6 +27,10 @@ fi
 echo "==> Installing COLMAP"
 brew list colmap >/dev/null 2>&1 || brew install colmap
 
+# NOTE: The optional "Global pose solver" setting uses COLMAP's own global SfM
+# (`colmap global_mapper`, the upstreamed successor to GLOMAP), so it needs no
+# extra tool — any COLMAP recent enough to ship that subcommand supports it.
+
 # --- OpenSplat build dependencies -------------------------------------------
 echo "==> Installing OpenSplat build dependencies (cmake, opencv, pytorch)"
 for pkg in cmake opencv pytorch; do

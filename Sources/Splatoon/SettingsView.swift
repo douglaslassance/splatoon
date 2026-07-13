@@ -73,6 +73,32 @@ struct SettingsView: View {
                     .disabled(!settings.useMultiImageReconstruction)
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Colour detail", selection: $settings.sceneSHDegree) {
+                        Text("Standard").tag(1)
+                        Text("High").tag(2)
+                        Text("Maximum").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Spherical-harmonics degree. Higher captures more view-dependent shine but "
+                         + "multiplies the splat's colour data (Maximum files are several times larger and "
+                         + "slower to render). Standard is plenty for most captures.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(!settings.useMultiImageReconstruction)
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Global pose solver", isOn: $settings.useGlobalPoseSolver)
+                    Text("Solve camera poses with COLMAP's global method (global_mapper) instead of its "
+                         + "incremental one. More robust on sparse or weakly-overlapping captures, where the "
+                         + "incremental solver often aligns only a fraction of the shots. Falls back "
+                         + "automatically on older COLMAP builds.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(!settings.useMultiImageReconstruction)
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
                 Label {
                     Text("For best results use a **video** (or several), or many overlapping photos in a slow "
                          + "continuous orbit. Spread-out angles won't align.")

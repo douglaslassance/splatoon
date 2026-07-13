@@ -71,6 +71,16 @@ final class MultiImageReconstructor {
     /// Number of OpenSplat training iterations. Higher = sharper, slower.
     var trainingIterations = 2000
 
+    /// Spherical-harmonics degree OpenSplat trains (1…3). Lower shrinks the splat
+    /// (fewer colour coefficients per gaussian) and speeds rendering.
+    var shDegree = 1
+
+    /// Solve poses with COLMAP's global SfM (`global_mapper`, the upstreamed
+    /// successor to the now-deprecated GLOMAP) instead of the incremental
+    /// `mapper`. More robust on sparse, weakly-overlapping captures. Falls back to
+    /// `mapper` if this COLMAP build predates `global_mapper`.
+    var useGlobalSolver = false
+
     private let lock = NSLock()
     private var currentProcess: Process?
     private var cancelled = false
@@ -175,14 +185,24 @@ final class MultiImageReconstructor {
         // 3. Sparse reconstruction (camera poses + sparse points). When the
         // photos can't be connected, the mapper produces no model and exits
         // nonzero — surface the friendly overlap guidance, not a raw COLMAP log.
+        //
+        // COLMAP's global SfM (`global_mapper`) is far more robust than the
+        // incremental `mapper` on sparse, weakly-overlapping captures, where the
+        // incremental solver often registers only a fraction of the views. It's
+        // the same binary and takes the same args, writing the same sparse/<n>
+        // model layout — so it's a drop-in for this stage. Used when the user opts
+        // in, guarded by a support probe so an older COLMAP falls back gracefully.
+        let subcommand = useGlobalSolver && colmapSupports("global_mapper") ? "global_mapper" : "mapper"
         report(bands[2], within: 0)
         do {
             try runTool(colmap, stage: "mapping", workDir: workDir, args: [
-                "mapper",
+                subcommand,
                 "--database_path", databaseURL.path,
                 "--image_path", imagesDir.path,
                 "--output_path", sparseDir.path,
             ]) { line in
+                // Incremental mapper prints per-image registration progress; the
+                // global one doesn't, so its band holds at the start until training.
                 guard totalImages > 0, let caps = Self.captures(#"num_reg_frames=(\d+)"#, in: line),
                       let n = Double(caps[0]) else { return }
                 report(bands[2], within: n / Double(totalImages))
@@ -200,10 +220,12 @@ final class MultiImageReconstructor {
             throw ReconstructionError.noSparseModel
         }
 
-        // Guard against the silent-garbage case: training on only a couple of
-        // views produces floater soup after a long wait. Fail fast, before the
-        // expensive training step, with capture guidance the user can act on.
-        let needed = max(3, Int(ceil(Double(totalImages) * 0.5)))
+        // Guard against the silent-garbage case: a marginal solve that registers
+        // only part of the capture produces floater soup after a long wait. Fail
+        // fast, before the expensive training step, with capture guidance the user
+        // can act on. 60% is deliberately stricter than a bare majority — a
+        // half-registered scene looks bad enough that guidance beats shipping it.
+        let needed = max(3, Int(ceil(Double(totalImages) * 0.6)))
         guard best.registered >= needed else {
             throw ReconstructionError.insufficientRegistration(registered: best.registered, total: totalImages)
         }
@@ -234,7 +256,9 @@ final class MultiImageReconstructor {
         // slower. So try the GPU path first and, if the trainer dies, retry once
         // on CPU rather than failing the whole reconstruction after COLMAP.
         func trainArgs(cpu: Bool) -> [String] {
-            var args = [workDir.path, "-n", String(trainingIterations), "-o", output.path]
+            // --sh-degree must be >= 1 (OpenSplat rejects 0); clamp defensively.
+            var args = [workDir.path, "-n", String(trainingIterations),
+                        "--sh-degree", String(min(3, max(1, shDegree))), "-o", output.path]
             if cpu { args.append("--cpu") }
             return args
         }
@@ -556,6 +580,12 @@ final class MultiImageReconstructor {
     /// spelling and falling back to the legacy one.
     private func gpuFlag(subcommand: String, preferred: String, legacy: String) -> String {
         helpText(colmap, subcommand).contains(preferred) ? preferred : legacy
+    }
+
+    /// Whether this COLMAP build offers `subcommand`. A valid subcommand's --help
+    /// lists `--database_path`; an unknown one prints an error without it.
+    private func colmapSupports(_ subcommand: String) -> Bool {
+        helpText(colmap, subcommand).contains("database_path")
     }
 
     /// Capture a subcommand's `--help` text (small; safe to read fully).
