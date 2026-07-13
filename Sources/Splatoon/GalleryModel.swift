@@ -162,7 +162,8 @@ final class GalleryModel: ObservableObject {
     /// siblings goes through single-image SHARP. Scenes are gated by
     /// `allowMultiImage` (the "Reconstruct multi-input scenes" setting).
     func open(_ asset: PHAsset, allowMultiImage: Bool = true,
-              options: SceneOptions = SceneOptions(iterations: 15000, shDegree: 1, globalPoseSolver: false),
+              options: SceneOptions = SceneOptions(iterations: 15000, shDegree: 1,
+                                                   globalPoseSolver: false, trainer: .openSplat),
               matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
         errorMessage = nil
         resetOpenedMesh()
@@ -461,6 +462,17 @@ final class GalleryModel: ObservableObject {
             return
         }
 
+        // Brush is opt-in. If selected but not resolvable, note it and fall back
+        // to OpenSplat rather than blocking the run.
+        var brushBinary: URL?
+        if options.trainer == .brush {
+            brushBinary = ToolLocator.resolveOrPrompt(for: .brush)
+            if brushBinary == nil {
+                errorMessage = "Brush isn't installed, so OpenSplat was used to train instead. "
+                    + "Run scripts/fetch-tools.sh to add it."
+            }
+        }
+
         opened = OpenedSplat(id: key, title: title, url: nil, isScene: true)
         sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Preparing…", fraction: 0)
         buildStartedAt[key] = Date()
@@ -471,6 +483,8 @@ final class GalleryModel: ObservableObject {
         // The global solver is COLMAP's own `global_mapper`, so no extra binary to
         // resolve; the reconstructor probes support and falls back if unavailable.
         reconstructor.useGlobalSolver = options.globalPoseSolver
+        reconstructor.trainerKind = brushBinary != nil ? .brush : .openSplat
+        reconstructor.brushBinary = brushBinary
         sceneReconstructor = reconstructor
 
         Task.detached(priority: .userInitiated) {

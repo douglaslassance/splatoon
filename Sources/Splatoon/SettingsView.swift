@@ -74,6 +74,21 @@ struct SettingsView: View {
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
 
                 VStack(alignment: .leading, spacing: 4) {
+                    Picker("Trainer", selection: $settings.sceneTrainer) {
+                        ForEach(SplatTrainer.allCases) { trainer in
+                            Text(trainer.displayName).tag(trainer)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    Text("OpenSplat is the reliable default. Brush is a native-Metal trainer (no libtorch), "
+                         + "usually much faster on Apple GPUs. If Brush isn't installed, OpenSplat is used instead.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(!settings.useMultiImageReconstruction)
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
+                VStack(alignment: .leading, spacing: 4) {
                     Picker("Colour detail", selection: $settings.sceneSHDegree) {
                         Text("Standard").tag(1)
                         Text("High").tag(2)

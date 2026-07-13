@@ -81,10 +81,20 @@ final class MultiImageReconstructor {
     /// `mapper` if this COLMAP build predates `global_mapper`.
     var useGlobalSolver = false
 
+    /// Which trainer runs step 4. `.openSplat` uses the `trainer` (opensplat)
+    /// binary; `.brush` uses `brushBinary`. When `.brush` but `brushBinary` is
+    /// nil, training falls back to OpenSplat.
+    var trainerKind: SplatTrainer = .openSplat
+    /// The `brush-cli` binary, resolved only when the Brush trainer is selected.
+    var brushBinary: URL?
+
     private let lock = NSLock()
     private var currentProcess: Process?
     private var cancelled = false
     private var pidLockURL: URL?
+    /// The active run's progress callback, stashed so the per-trainer helpers can
+    /// report without threading the closure through every call. Set in `run`.
+    private var progressSink: ((ReconstructionProgress) -> Void)?
 
     init(colmap: URL, trainer: URL) {
         self.colmap = colmap
@@ -121,8 +131,10 @@ final class MultiImageReconstructor {
         Self.killStaleProcess(for: output)
         let lockURL = Self.pidLockURL(for: output)
         self.pidLockURL = lockURL
+        self.progressSink = progress
         defer {
             self.pidLockURL = nil
+            self.progressSink = nil
             try? FileManager.default.removeItem(at: lockURL)
         }
 
@@ -247,14 +259,39 @@ final class MultiImageReconstructor {
             try? fm.createSymbolicLink(at: projectImages, withDestinationURL: imagesDir)
         }
 
-        // 4. Train the Gaussian splat. OpenSplat prints its own percentage
-        // (relative to -n), already exactly what we want for `within`.
-        //
-        // OpenSplat's Metal (MPS) backend hard-crashes (SIGSEGV) during image
-        // loading on some builds — reliably so with the 1.1.5 Homebrew binary,
-        // even for a couple dozen images. Its CPU backend is reliable but much
-        // slower. So try the GPU path first and, if the trainer dies, retry once
-        // on CPU rather than failing the whole reconstruction after COLMAP.
+        // 4. Train the Gaussian splat. Both trainers read this COLMAP project and
+        // write a standard 3DGS PLY to `output`; each also leaves a scene-scoped
+        // cameras.json next to it (OpenSplat writes one; for Brush we synthesize
+        // it from the COLMAP model) for pose recovery + gravity alignment.
+        let trainBand = bands[3]
+        report(trainBand, within: 0)
+        let zeroModel = sparseDir.appendingPathComponent("0", isDirectory: true)
+        if trainerKind == .brush, let brushBinary {
+            try trainWithBrush(brushBinary, workDir: workDir, sparseZero: zeroModel,
+                               output: output, band: trainBand)
+        } else {
+            try trainWithOpenSplat(workDir: workDir, output: output, band: trainBand)
+        }
+
+        guard fm.fileExists(atPath: output.path) else { throw ReconstructionError.noOutput }
+
+        // COLMAP's world frame is arbitrary (built off its bootstrap image pair),
+        // so scenes come out tilted — the horizon isn't level and the fly camera
+        // feels off. Rotate the splat + camera poses so the estimated gravity-up
+        // becomes world-up, matching single-image splats' upright convention.
+        Self.gravityAlign(plyURL: output, camerasURL: Self.camerasURL(for: output))
+    }
+
+    // MARK: - Trainers
+
+    /// Train with OpenSplat (libtorch/MPS). Prints its own per-step percentage,
+    /// exactly what `within` wants. Its Metal backend hard-crashes (SIGSEGV)
+    /// during image loading on some builds — reliably so with the 1.1.5 Homebrew
+    /// binary. Its CPU backend is reliable but much slower, so try GPU first and,
+    /// if the trainer dies, retry once on CPU rather than failing after COLMAP.
+    /// Moves OpenSplat's fixed-name cameras.json to this scene's scoped name.
+    private func trainWithOpenSplat(workDir: URL, output: URL,
+                                    band: (stage: String, start: Double, end: Double)) throws {
         func trainArgs(cpu: Bool) -> [String] {
             // --sh-degree must be >= 1 (OpenSplat rejects 0); clamp defensively.
             var args = [workDir.path, "-n", String(trainingIterations),
@@ -262,20 +299,22 @@ final class MultiImageReconstructor {
             if cpu { args.append("--cpu") }
             return args
         }
-        let trainBand = bands[3]
-        let cpuBand = (stage: "Training splat (CPU, slower)…", start: trainBand.start, end: trainBand.end)
-        func onTrainLine(_ band: (stage: String, start: Double, end: Double)) -> (String) -> Void {
+        let cpuBand = (stage: "Training splat (CPU, slower)…", start: band.start, end: band.end)
+        func report(_ b: (stage: String, start: Double, end: Double), within: Double) {
+            let f = b.start + (b.end - b.start) * max(0, min(1, within))
+            progressSink?(ReconstructionProgress(stageLabel: b.stage, fraction: f))
+        }
+        func onTrainLine(_ b: (stage: String, start: Double, end: Double)) -> (String) -> Void {
             { line in
                 guard let caps = Self.captures(#"Step \d+: [^(]*\((\d+)%\)"#, in: line),
                       let percent = Double(caps[0]) else { return }
-                report(band, within: percent / 100)
+                report(b, within: percent / 100)
             }
         }
 
-        report(trainBand, within: 0)
         do {
             try runTool(trainer, stage: "training", workDir: workDir,
-                        args: trainArgs(cpu: false), onLine: onTrainLine(trainBand))
+                        args: trainArgs(cpu: false), onLine: onTrainLine(band))
         } catch ReconstructionError.toolFailed {
             // GPU trainer crashed. Don't retry if the user cancelled meanwhile.
             if isCancelled { throw ReconstructionError.cancelled }
@@ -284,22 +323,163 @@ final class MultiImageReconstructor {
                         args: trainArgs(cpu: true), onLine: onTrainLine(cpuBand))
         }
 
-        guard fm.fileExists(atPath: output.path) else { throw ReconstructionError.noOutput }
-
-        // OpenSplat also writes cameras.json next to `output`, always under that
-        // fixed name — move it to a name scoped to this scene before it collides
-        // with the next reconstruction's cameras.json in the same cache directory.
+        // OpenSplat writes cameras.json next to `output` under that fixed name —
+        // move it to a scene-scoped name before the next reconstruction's collides.
+        let fm = FileManager.default
         let writtenCameras = output.deletingLastPathComponent().appendingPathComponent("cameras.json")
         if fm.fileExists(atPath: writtenCameras.path) {
             try? fm.removeItem(at: Self.camerasURL(for: output))
             try? fm.moveItem(at: writtenCameras, to: Self.camerasURL(for: output))
         }
+    }
 
-        // COLMAP's world frame is arbitrary (built off its bootstrap image pair),
-        // so scenes come out tilted — the horizon isn't level and the fly camera
-        // feels off. Rotate the splat + camera poses so the estimated gravity-up
-        // becomes world-up, matching single-image splats' upright convention.
-        Self.gravityAlign(plyURL: output, camerasURL: Self.camerasURL(for: output))
+    /// Train with Brush (native wgpu/Metal). Brush reads the COLMAP project
+    /// directly and exports only a PLY, so we point its export at a scratch dir
+    /// with a fixed name, move the result to `output`, then synthesize the
+    /// cameras.json Brush doesn't write from the COLMAP model.
+    private func trainWithBrush(_ brush: URL, workDir: URL, sparseZero: URL, output: URL,
+                                band: (stage: String, start: Double, end: Double)) throws {
+        let fm = FileManager.default
+        let exportDir = workDir.appendingPathComponent("brush_export", isDirectory: true)
+        try? fm.removeItem(at: exportDir)
+        try? fm.createDirectory(at: exportDir, withIntermediateDirectories: true)
+
+        // Brush loads the COLMAP project at `workDir` (viewer defaults off when a
+        // source is given). sh-degree is 0…4 (unlike OpenSplat it allows 0). Brush
+        // always exports on the final step, so a large --export-every just avoids
+        // redundant intermediate writes; we take the newest PLY afterward.
+        let args = [
+            workDir.path,
+            "--total-train-iters", String(trainingIterations),
+            "--sh-degree", String(min(4, max(0, shDegree))),
+            "--max-resolution", "1920",
+            "--export-path", exportDir.path,
+            "--export-name", "splat.ply",
+            "--export-every", String(trainingIterations),
+        ]
+        // RUST_LOG=info surfaces Brush's "Refine iter N" progress lines (its
+        // logger is otherwise silent at the default error level).
+        try runTool(brush, stage: "training", workDir: workDir, args: args,
+                    env: ["RUST_LOG": "info"]) { [weak self] line in
+            // Brush logs "Refine iter N, C splats." every refine step (~200 steps).
+            guard let self, self.trainingIterations > 0,
+                  let caps = Self.captures(#"Refine iter (\d+)"#, in: line),
+                  let n = Double(caps[0]) else { return }
+            let within = max(0, min(1, n / Double(self.trainingIterations)))
+            self.progressSink?(ReconstructionProgress(stageLabel: band.stage,
+                                                      fraction: band.start + (band.end - band.start) * within))
+        }
+
+        // Locate Brush's exported PLY (newest, in case it exported more than once)
+        // and move it to `output`.
+        let produced = ((try? fm.contentsOfDirectory(at: exportDir,
+                                                     includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.pathExtension.lowercased() == "ply" }
+            .max { (Self.modDate($0) ?? .distantPast) < (Self.modDate($1) ?? .distantPast) }
+        guard let produced else { throw ReconstructionError.noOutput }
+        try? fm.removeItem(at: output)
+        try fm.moveItem(at: produced, to: output)
+
+        // Brush writes no camera metadata; synthesize the cameras.json our pose
+        // recovery + gravity alignment read, from the COLMAP model.
+        writeCamerasJSON(fromColmapSparse: sparseZero, workDir: workDir,
+                         to: Self.camerasURL(for: output))
+    }
+
+    private static func modDate(_ url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    /// Build the OpenSplat-schema cameras.json our pose recovery + gravity
+    /// alignment consume, straight from the COLMAP sparse model — used for the
+    /// Brush path, which exports no camera metadata. Converts the binary model to
+    /// text with `model_converter`, then maps each registered image's
+    /// world-to-camera pose to the camera-to-world (position, rotation) form.
+    /// Silent no-op on failure: cameras.json stays absent and `initialPose`
+    /// falls back to opening at the origin.
+    private func writeCamerasJSON(fromColmapSparse sparseZero: URL, workDir: URL, to camerasURL: URL) {
+        let fm = FileManager.default
+        let txtDir = workDir.appendingPathComponent("sparse_txt", isDirectory: true)
+        try? fm.removeItem(at: txtDir)
+        try? fm.createDirectory(at: txtDir, withIntermediateDirectories: true)
+        do {
+            try runTool(colmap, stage: "camera export", workDir: workDir, args: [
+                "model_converter",
+                "--input_path", sparseZero.path,
+                "--output_path", txtDir.path,
+                "--output_type", "TXT",
+            ])
+        } catch { return }
+        guard let cameras = Self.parseColmapModel(txtDir: txtDir), !cameras.isEmpty,
+              let data = try? JSONEncoder().encode(cameras) else { return }
+        try? data.write(to: camerasURL)
+    }
+
+    /// Parse COLMAP's text `cameras.txt` + `images.txt` into cameras.json rows,
+    /// ordered by image name (so the first row is the first captured frame, the
+    /// pose `initialPose` opens at). Returns nil if the files can't be read.
+    private static func parseColmapModel(txtDir: URL) -> [SceneCamera]? {
+        guard let camerasText = try? String(contentsOf: txtDir.appendingPathComponent("cameras.txt"), encoding: .utf8),
+              let imagesText = try? String(contentsOf: txtDir.appendingPathComponent("images.txt"), encoding: .utf8)
+        else { return nil }
+
+        // cameras.txt: CAMERA_ID MODEL WIDTH HEIGHT PARAMS…
+        // Single-focal models put one focal in PARAMS[0]; the rest use fx,fy.
+        let singleFocal: Set<String> = ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL",
+                                        "SIMPLE_RADIAL_FISHEYE", "RADIAL_FISHEYE", "FOV", "THIN_PRISM_FISHEYE"]
+        struct Intrinsics { let width: Int; let height: Int; let fx: Float; let fy: Float }
+        var intrinsics: [Int: Intrinsics] = [:]
+        for line in camerasText.split(separator: "\n") where !line.hasPrefix("#") {
+            let f = line.split(separator: " ").map(String.init)
+            guard f.count >= 5, let id = Int(f[0]), let w = Int(f[2]), let h = Int(f[3]) else { continue }
+            let params = f[4...].compactMap { Float($0) }
+            guard let p0 = params.first else { continue }
+            let fx = p0
+            let fy = singleFocal.contains(f[1]) ? p0 : (params.count > 1 ? params[1] : p0)
+            intrinsics[id] = Intrinsics(width: w, height: h, fx: fx, fy: fy)
+        }
+
+        // images.txt: two lines per image; the first is
+        // IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME. Skip the second (points).
+        var cameras: [SceneCamera] = []
+        let imageLines = imagesText.split(separator: "\n", omittingEmptySubsequences: true)
+        var i = 0
+        while i < imageLines.count {
+            let line = imageLines[i]
+            if line.hasPrefix("#") { i += 1; continue }
+            let f = line.split(separator: " ").map(String.init)
+            // A pose line has ≥10 fields; its following points line is skipped.
+            guard f.count >= 10,
+                  let id = Int(f[0]),
+                  let qw = Double(f[1]), let qx = Double(f[2]), let qy = Double(f[3]), let qz = Double(f[4]),
+                  let tx = Double(f[5]), let ty = Double(f[6]), let tz = Double(f[7]),
+                  let camID = Int(f[8]) else { i += 1; continue }
+            let name = f[9...].joined(separator: " ")
+            i += 2   // consume the pose line and its points line
+
+            // COLMAP stores world-to-camera R (from quaternion) and t. cameras.json
+            // wants camera-to-world: rotation = Rᵀ, position (camera centre) = −Rᵀt.
+            let n = (qw*qw + qx*qx + qy*qy + qz*qz).squareRoot()
+            guard n > 1e-9 else { continue }
+            let w = qw/n, x = qx/n, y = qy/n, z = qz/n
+            // R rows (world→camera).
+            let r00 = 1 - 2*(y*y + z*z), r01 = 2*(x*y - z*w),     r02 = 2*(x*z + y*w)
+            let r10 = 2*(x*y + z*w),     r11 = 1 - 2*(x*x + z*z), r12 = 2*(y*z - x*w)
+            let r20 = 2*(x*z - y*w),     r21 = 2*(y*z + x*w),     r22 = 1 - 2*(x*x + y*y)
+            // Rᵀ (camera→world), row-major.
+            let rt: [[Float]] = [[Float(r00), Float(r10), Float(r20)],
+                                 [Float(r01), Float(r11), Float(r21)],
+                                 [Float(r02), Float(r12), Float(r22)]]
+            // −Rᵀt.
+            let cx = -(r00*tx + r10*ty + r20*tz)
+            let cy = -(r01*tx + r11*ty + r21*tz)
+            let cz = -(r02*tx + r12*ty + r22*tz)
+            let intr = intrinsics[camID]
+            cameras.append(SceneCamera(id: id, img_name: name, width: intr?.width, height: intr?.height,
+                                       fx: intr?.fx, fy: intr?.fy,
+                                       position: [Float(cx), Float(cy), Float(cz)], rotation: rt))
+        }
+        return cameras.sorted { ($0.img_name ?? "") < ($1.img_name ?? "") }
     }
 
     /// The registered camera poses OpenSplat trained against, scoped to `plyURL`.
@@ -610,7 +790,7 @@ final class MultiImageReconstructor {
     /// `<stage>.log` for post-mortem debugging and, line by line, handed to
     /// `onLine` for live progress parsing. Throws on nonzero exit.
     private func runTool(_ executable: URL, stage: String, workDir: URL, args: [String],
-                         onLine: ((String) -> Void)? = nil) throws {
+                         env: [String: String]? = nil, onLine: ((String) -> Void)? = nil) throws {
         if isCancelled { throw ReconstructionError.cancelled }
 
         let fm = FileManager.default
@@ -648,6 +828,9 @@ final class MultiImageReconstructor {
         process.currentDirectoryURL = workDir
         process.standardOutput = pipe
         process.standardError = pipe
+        if let env {
+            process.environment = ProcessInfo.processInfo.environment.merging(env) { _, new in new }
+        }
 
         lock.lock(); currentProcess = process; lock.unlock()
 

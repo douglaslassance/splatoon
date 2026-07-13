@@ -44,27 +44,50 @@ enum MeshMethod: String, CaseIterable, Identifiable {
     }
 }
 
+/// The Gaussian-splat trainer the multi-image pipeline uses. Both consume the
+/// same COLMAP project and produce a standard 3DGS PLY; they differ in backend.
+enum SplatTrainer: String, CaseIterable, Identifiable {
+    /// libtorch/MPS trainer. The reliable default (ships via fetch-tools.sh), but
+    /// its Metal path is crash-prone and it falls back to slow CPU.
+    case openSplat
+    /// Native wgpu/Metal trainer. No libtorch, no CPU fallback — typically much
+    /// faster on Apple GPUs. Optional; built with `cargo` (see fetch-tools.sh).
+    case brush
+
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .openSplat: return "OpenSplat (libtorch)"
+        case .brush:     return "Brush (native Metal)"
+        }
+    }
+}
+
 /// The multi-image reconstruction knobs that change the output PLY, bundled so
 /// they thread through `open`/`regenerateOpened` together and fold into the
 /// splat's cache key as a unit (reopening after any change retrains instead of
 /// reusing a stale splat).
 struct SceneOptions: Equatable {
-    /// OpenSplat training steps. More = sharper, slower.
+    /// Training steps. More = sharper, slower.
     var iterations: Int
-    /// Spherical-harmonics degree OpenSplat trains, 1…3. Lower means far smaller
-    /// files and faster rendering at the cost of some view-dependent shading;
-    /// degree 1 is plenty for casual captures (degree 3 stores 45 colour
-    /// coefficients per splat, degree 1 only 9).
+    /// Spherical-harmonics degree the trainer uses. Lower means far smaller files
+    /// and faster rendering at the cost of some view-dependent shading; degree 1
+    /// is plenty for casual captures (degree 3 stores 45 colour coefficients per
+    /// splat, degree 1 only 9).
     var shDegree: Int
     /// Solve camera poses with COLMAP's global SfM (`global_mapper`) instead of
     /// its incremental mapper. More robust on sparse, weakly-overlapping captures,
     /// where the incremental mapper often registers only a fraction of the views.
     var globalPoseSolver: Bool
+    /// Which trainer runs the splat optimization.
+    var trainer: SplatTrainer
 
     /// Cache-key suffix. Every field changes the resulting PLY, so each belongs
     /// here, matching the old `-i<iters>` key while adding the new knobs.
     var cacheSuffix: String {
-        "-i\(iterations)-sh\(shDegree)" + (globalPoseSolver ? "-global" : "")
+        "-i\(iterations)-sh\(shDegree)"
+            + (globalPoseSolver ? "-global" : "")
+            + (trainer == .brush ? "-brush" : "")
     }
 }
 
@@ -101,6 +124,11 @@ final class MeshSettings: ObservableObject {
     /// Same COLMAP binary; falls back to the incremental mapper on older builds.
     @Published var useGlobalPoseSolver: Bool {
         didSet { defaults.set(useGlobalPoseSolver, forKey: Keys.useGlobalPoseSolver) }
+    }
+    /// Which trainer runs the splat optimization. Defaults to OpenSplat (the
+    /// always-installed one); Brush is used only if it resolves, else falls back.
+    @Published var sceneTrainer: SplatTrainer {
+        didSet { defaults.set(sceneTrainer.rawValue, forKey: Keys.sceneTrainer) }
     }
     /// Mesh method for single-image (SHARP) splats — any of the three.
     @Published var singleImageMethod: MeshMethod {
@@ -141,7 +169,8 @@ final class MeshSettings: ObservableObject {
     var sceneOptions: SceneOptions {
         SceneOptions(iterations: Int(multiImageIterations),
                      shDegree: sceneSHDegree,
-                     globalPoseSolver: useGlobalPoseSolver)
+                     globalPoseSolver: useGlobalPoseSolver,
+                     trainer: sceneTrainer)
     }
 
     /// The mesh method for the given splat kind.
@@ -163,6 +192,7 @@ final class MeshSettings: ObservableObject {
         static let multiImageIterations = "reconstruction.multiImageIterations"
         static let sceneSHDegree = "reconstruction.sceneSHDegree"
         static let useGlobalPoseSolver = "reconstruction.useGlobalPoseSolver"
+        static let sceneTrainer = "reconstruction.sceneTrainer"
         static let singleImageMethod = "mesh.singleImageMethod"
         static let sceneMethod = "mesh.sceneMethod"
         static let smoothGrid = "mesh.smoothGrid"
@@ -180,6 +210,7 @@ final class MeshSettings: ObservableObject {
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { min(3, max(1, $0)) } ?? 1
         useGlobalPoseSolver = defaults.object(forKey: Keys.useGlobalPoseSolver) as? Bool ?? false
+        sceneTrainer = SplatTrainer(rawValue: defaults.string(forKey: Keys.sceneTrainer) ?? "") ?? .openSplat
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
         sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .density
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false

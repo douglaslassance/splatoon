@@ -3,18 +3,36 @@ import AppKit
 
 /// External command-line tools the multi-image pipeline shells out to.
 ///
-/// COLMAP solves camera poses (sparse reconstruction); OpenSplat trains the
-/// Gaussian splat from that COLMAP project. OpenSplat is used over Brush because
-/// its CLI is stable and documented (`opensplat <dir> -n <iters> -o out.ply`),
-/// and it runs on Apple Metal without CUDA.
+/// COLMAP solves camera poses (sparse reconstruction); a trainer turns that
+/// COLMAP project into a Gaussian splat. OpenSplat (libtorch/MPS) is the default,
+/// always-installed trainer; Brush (native wgpu/Metal, headless `brush-cli`) is
+/// an opt-in alternative selected by the "Trainer" setting.
 enum ReconstructionTool: String, CaseIterable {
     case colmap
     case opensplat
+    /// Optional native-Metal trainer, selected by the "Trainer" setting. Not in
+    /// `required`, so its absence doesn't gate the multi-image feature.
+    case brush
+
+    /// The tools the pipeline always needs (COLMAP + the default trainer). Brush
+    /// is opt-in, so it's excluded.
+    static let required: [ReconstructionTool] = [.colmap, .opensplat]
 
     var displayName: String {
         switch self {
         case .colmap:    return "COLMAP"
         case .opensplat: return "OpenSplat"
+        case .brush:     return "Brush"
+        }
+    }
+
+    /// The executable's filename on disk (differs from the case name for Brush,
+    /// whose headless binary is `brush-cli`).
+    var binaryName: String {
+        switch self {
+        case .colmap:    return "colmap"
+        case .opensplat: return "opensplat"
+        case .brush:     return "brush-cli"
         }
     }
 
@@ -25,6 +43,7 @@ enum ReconstructionTool: String, CaseIterable {
         switch self {
         case .colmap:    return "Install with `brew install colmap`, or run scripts/fetch-tools.sh."
         case .opensplat: return "Build/download OpenSplat via scripts/fetch-tools.sh."
+        case .brush:     return "Install with `cargo install --git https://github.com/ArthurBrussee/brush brush-cli`, or run scripts/fetch-tools.sh."
         }
     }
 }
@@ -50,18 +69,21 @@ enum ToolLocator {
             return URL(fileURLWithPath: path)
         }
         if let resources = Bundle.main.resourceURL {
-            let bundled = resources.appendingPathComponent("bin/\(tool.rawValue)")
+            let bundled = resources.appendingPathComponent("bin/\(tool.binaryName)")
             if fm.isExecutableFile(atPath: bundled.path) { return bundled }
         }
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-            let candidate = "\(dir)/\(tool.rawValue)"
+        // ~/.cargo/bin is where `cargo install` drops Brush; the rest are the
+        // usual Homebrew/system locations.
+        let cargoBin = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cargo/bin").path
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", cargoBin] {
+            let candidate = "\(dir)/\(tool.binaryName)"
             if fm.isExecutableFile(atPath: candidate) { return URL(fileURLWithPath: candidate) }
         }
         return nil
     }
 
     static var isAvailable: Bool {
-        ReconstructionTool.allCases.allSatisfy { resolvedURL(for: $0) != nil }
+        ReconstructionTool.required.allSatisfy { resolvedURL(for: $0) != nil }
     }
 
     /// Resolve, prompting the user to locate the binary if it isn't found. Must

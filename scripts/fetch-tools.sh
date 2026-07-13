@@ -31,6 +31,19 @@ brew list colmap >/dev/null 2>&1 || brew install colmap
 # (`colmap global_mapper`, the upstreamed successor to GLOMAP), so it needs no
 # extra tool — any COLMAP recent enough to ship that subcommand supports it.
 
+# --- Brush (optional, native-Metal trainer) ----------------------------------
+# Selected by the "Trainer" setting. Native wgpu/Metal (no libtorch, no CPU
+# fallback), usually much faster on Apple GPUs. Built with cargo into
+# ~/.cargo/bin, which Splatoon's tool search path includes. Its headless binary
+# only exists on `main` (post-v0.3.0), and `--locked` is required so it builds
+# against the burn version it was tested with.
+if command -v cargo >/dev/null 2>&1; then
+  echo "==> Building Brush (brush-cli) with cargo"
+  cargo install --git https://github.com/ArthurBrussee/brush --locked --bin brush-cli brush-cli
+else
+  echo "==> Skipping Brush: cargo (Rust) not found. Install Rust from https://rustup.rs to enable the Brush trainer." >&2
+fi
+
 # --- OpenSplat build dependencies -------------------------------------------
 echo "==> Installing OpenSplat build dependencies (cmake, opencv, pytorch)"
 for pkg in cmake opencv pytorch; do
