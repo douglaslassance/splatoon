@@ -28,6 +28,14 @@ struct SceneProgressBar: View {
         }
     }
 
+    /// While running, the stage label; once complete, the stage plus compute time
+    /// ("Ready in 2m 14s · tap to view").
+    private func completionText(for progress: GalleryModel.SceneProgress) -> String {
+        guard progress.isComplete else { return progress.stageLabel }
+        let timed = progress.elapsed.map { "\(progress.stageLabel) in \($0)" } ?? progress.stageLabel
+        return timed + " · tap to view"
+    }
+
     @ViewBuilder
     private func content(for progress: GalleryModel.SceneProgress) -> some View {
         HStack(spacing: 12) {
@@ -37,7 +45,7 @@ struct SceneProgressBar: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(progress.title).font(.subheadline.weight(.medium))
-                Text(progress.isComplete ? "Ready — tap to view" : progress.stageLabel)
+                Text(completionText(for: progress))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

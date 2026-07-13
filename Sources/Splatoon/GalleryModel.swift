@@ -42,6 +42,7 @@ final class GalleryModel: ObservableObject {
         var isScene = true       // scenes reopen at a registered camera pose; SHARP doesn't
         var cancellable = true   // multi-image can be cancelled; SHARP is too fast to bother
         var indeterminate = false // no measurable fraction (splat load, mesh build)
+        var elapsed: String?     // human compute time, shown once complete
     }
 
     @Published private(set) var authorization: PHAuthorizationStatus =
@@ -74,6 +75,19 @@ final class GalleryModel: ObservableObject {
     /// The source asset (tapped photo / video) each opened splat was built from,
     /// keyed by the splat's cache id — so it can be regenerated on demand.
     private var sourceForOpened: [String: PHAsset] = [:]
+
+    /// Wall-clock start of an in-flight build (SHARP generation or multi-image
+    /// reconstruction), keyed like `sceneProgress`, to report compute time on
+    /// completion.
+    private var buildStartedAt: [String: Date] = [:]
+
+    /// Compute time as a compact human string ("2.4s", "3m 12s").
+    private static func elapsedString(since start: Date) -> String {
+        let seconds = Date().timeIntervalSince(start)
+        if seconds < 60 { return String(format: "%.1fs", seconds) }
+        let total = Int(seconds.rounded())
+        return "\(total / 60)m \(total % 60)s"
+    }
 
     let imageManager = PHCachingImageManager()
 
@@ -188,6 +202,7 @@ final class GalleryModel: ObservableObject {
         opened = OpenedSplat(id: identifier, title: title, url: nil)
         sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Loading photo…",
                                       fraction: 0.05, isScene: false, cancellable: false)
+        buildStartedAt[identifier] = Date()
         let requestOptions = PHImageRequestOptions()
         requestOptions.isNetworkAccessAllowed = true
         requestOptions.deliveryMode = .highQualityFormat
@@ -272,8 +287,9 @@ final class GalleryModel: ObservableObject {
     /// auto-dismisses, and lets a user who wandered off tap back in).
     private func completeGeneration(key: String, title: String, isScene: Bool) {
         guard sceneProgress?.key == key else { return }
+        let elapsed = buildStartedAt.removeValue(forKey: key).map(Self.elapsedString(since:))
         sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Ready", fraction: 1,
-                                      isComplete: true, isScene: isScene, cancellable: false)
+                                      isComplete: true, isScene: isScene, cancellable: false, elapsed: elapsed)
     }
 
     private func failGeneration(key: String, message: String) {
@@ -401,6 +417,7 @@ final class GalleryModel: ObservableObject {
         opened = OpenedSplat(id: identifier, title: title, url: nil)
         sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Extracting frame…",
                                       fraction: 0.05, isScene: false, cancellable: false)
+        buildStartedAt[identifier] = Date()
         Task { @MainActor in
             guard let avAsset = await self.avAsset(for: asset),
                   let cgImage = await Self.sharpestFrame(from: avAsset) else {
@@ -444,6 +461,7 @@ final class GalleryModel: ObservableObject {
 
         opened = OpenedSplat(id: key, title: title, url: nil, isScene: true)
         sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Preparing…", fraction: 0)
+        buildStartedAt[key] = Date()
 
         let reconstructor = MultiImageReconstructor(colmap: colmap, trainer: trainer)
         reconstructor.trainingIterations = iterations
@@ -490,8 +508,9 @@ final class GalleryModel: ObservableObject {
                     // Leave a brief "Ready" state on the docked bar so a user who
                     // wandered off notices it finished; tapping or a new scene
                     // request clears it (see reopenInProgressScene/dismiss).
+                    let elapsed = self.buildStartedAt.removeValue(forKey: key).map(Self.elapsedString(since:))
                     self.sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Ready",
-                                                       fraction: 1, isComplete: true)
+                                                       fraction: 1, isComplete: true, elapsed: elapsed)
                 }
                 try? fm.removeItem(at: workDir)
             } catch {
@@ -717,6 +736,10 @@ final class GalleryModel: ObservableObject {
 
         openedMesh = nil
         openedMeshKey = key
+        let meshStart = Date()
+        let meshTitle = opened.title
+        let meshIsScene = opened.isScene
+        let meshOwnerID = opened.id
         setIndeterminate("Building mesh…")
         Task.detached(priority: .userInitiated) {
             do {
@@ -728,7 +751,11 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }  // superseded meanwhile
                     self.openedMesh = mesh
-                    self.clearIndeterminate()
+                    // Show the mesh compute time in the docked bar (auto-dismisses).
+                    self.sceneProgress = SceneProgress(key: meshOwnerID, title: meshTitle,
+                                                       stageLabel: "Mesh ready", fraction: 1, isComplete: true,
+                                                       isScene: meshIsScene, cancellable: false,
+                                                       elapsed: Self.elapsedString(since: meshStart))
                 }
             } catch {
                 await MainActor.run {
