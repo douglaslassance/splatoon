@@ -127,7 +127,7 @@ struct MeshViewer: NSViewRepresentable {
         private var lastFrameTime: CFTimeInterval?
 
         private var fovDegrees: Float = sharpFOVyDegrees   // set per-pose in install()
-        private let lookSensitivity: Float = 0.005
+        private let lookSensitivity: Float = 0.0025
         private var moveSpeed: Float = 8        // world units/sec, scaled to mesh size
         private var dollyScale: Float = 0.05    // per scroll unit, scaled to mesh size
         private var panSensitivity: Float = 0.016   // world units per pixel, scaled to mesh size
@@ -170,8 +170,8 @@ struct MeshViewer: NSViewRepresentable {
             scene.rootNode.addChildNode(camNode)
             cameraNode = camNode
 
-            moveSpeed = radius * 1.5
-            dollyScale = radius * 0.01
+            moveSpeed = radius * 0.7
+            dollyScale = radius * 0.006
             panSensitivity = moveSpeed * 0.002
 
             applyCameraTransform()

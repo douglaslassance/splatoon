@@ -147,7 +147,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     /// Vertical FOV: the registered camera's for scenes, SHARP's ~53° otherwise,
     /// so a splat opens framed like its source photo.
     private var fovy: Float { (initialPose?.fovyDegrees ?? sharpFOVyDegrees) * .pi / 180 }
-    private let lookSensitivity: Float = 0.005
+    private let lookSensitivity: Float = 0.0025
     // Navigation speeds scale to the loaded splat's size (calibrateSpeeds), using
     // the SAME formulas as MeshViewer so Splat↔Mesh move at a matching rate.
     private var moveSpeed: Float = 8        // world units per second
@@ -195,8 +195,8 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
             mn = simd_min(mn, p.position); mx = simd_max(mx, p.position)
         }
         let radius = max(simd_length(mx - (mn + mx) / 2), 1e-3)
-        moveSpeed = radius * 1.5
-        dollyScale = radius * 0.01
+        moveSpeed = radius * 0.7
+        dollyScale = radius * 0.006
         panSensitivity = moveSpeed * 0.002
     }
 
