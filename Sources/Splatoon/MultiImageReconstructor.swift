@@ -380,10 +380,95 @@ final class MultiImageReconstructor {
         try? fm.removeItem(at: output)
         try fm.moveItem(at: produced, to: output)
 
+        // Brush leaves a few giant "background" splats (tens of world units) that
+        // engulf the camera and wash the view flat; OpenSplat culls these during
+        // training, Brush doesn't. Drop them before display.
+        Self.cullOversizedSplats(output)
+
         // Brush writes no camera metadata; synthesize the cameras.json our pose
         // recovery + gravity alignment read, from the COLMAP model.
         writeCamerasJSON(fromColmapSparse: sparseZero, workDir: workDir,
                          to: Self.camerasURL(for: output))
+    }
+
+    /// Drop pathologically large splats from a 3DGS PLY in place: any whose
+    /// largest axis exceeds 50× the median splat's largest axis. That factor is
+    /// scene-scale-invariant (it rides the splat-size distribution, not world
+    /// units or the floater-inflated bounding box), so it removes only the handful
+    /// of camera-engulfing outliers Brush leaves behind and never touches
+    /// legitimate detail. Best-effort: leaves the file untouched if it can't parse
+    /// the PLY, finds nothing to cull, or would cull everything.
+    private static func cullOversizedSplats(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let headerRange = data.range(of: Data("end_header\n".utf8)),
+              let header = String(data: data.subdata(in: 0..<headerRange.upperBound), encoding: .ascii) else {
+            return
+        }
+        var format = "", count = 0, inVertex = false, offset = 0
+        var offsetOf: [String: Int] = [:]
+        for line in header.split(separator: "\n") {
+            let parts = line.split(separator: " ").map(String.init)
+            guard let keyword = parts.first else { continue }
+            switch keyword {
+            case "format" where parts.count >= 2:
+                format = parts[1]
+            case "element" where parts.count >= 3:
+                inVertex = (parts[1] == "vertex")
+                if inVertex { count = Int(parts[2]) ?? 0 }
+            case "property" where inVertex && parts.count >= 3 && parts[1] != "list":
+                offsetOf[parts[2]] = offset
+                offset += typeSize(parts[1])
+            default:
+                break
+            }
+        }
+        let stride = offset
+        let bodyStart = headerRange.upperBound
+        guard format == "binary_little_endian", count > 0, stride > 0,
+              bodyStart + count * stride <= data.count,
+              let s0 = offsetOf["scale_0"], let s1 = offsetOf["scale_1"], let s2 = offsetOf["scale_2"] else {
+            return
+        }
+
+        var survivors: [Int] = []
+        survivors.reserveCapacity(count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            // Largest world-space axis of splat i (scales are stored logarithmic).
+            func maxAxis(_ i: Int) -> Double {
+                let base = bodyStart + i * stride
+                let a = raw.loadUnaligned(fromByteOffset: base + s0, as: Float.self)
+                let b = raw.loadUnaligned(fromByteOffset: base + s1, as: Float.self)
+                let c = raw.loadUnaligned(fromByteOffset: base + s2, as: Float.self)
+                return exp(Double(max(a, max(b, c))))
+            }
+            // Median over a bounded sample (exact median needs no more precision).
+            var sample: [Double] = []
+            let step = max(1, count / 200_000)
+            var s = 0
+            while s < count { sample.append(maxAxis(s)); s += step }
+            sample.sort()
+            let median = sample[sample.count / 2]
+            let threshold = median * 50
+            guard threshold.isFinite, threshold > 0 else { return }
+            for i in 0..<count where maxAxis(i) <= threshold { survivors.append(i) }
+        }
+        // Nothing oversized, or (defensively) everything culled — leave as-is.
+        guard survivors.count < count, !survivors.isEmpty else { return }
+
+        var body = [UInt8](repeating: 0, count: survivors.count * stride)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            body.withUnsafeMutableBytes { dst in
+                for (j, idx) in survivors.enumerated() {
+                    memcpy(dst.baseAddress!.advanced(by: j * stride),
+                           raw.baseAddress!.advanced(by: bodyStart + idx * stride), stride)
+                }
+            }
+        }
+        let newHeader = header.replacingOccurrences(of: "element vertex \(count)",
+                                                    with: "element vertex \(survivors.count)")
+        var result = Data(newHeader.utf8)
+        result.append(contentsOf: body)
+        try? result.write(to: url)
     }
 
     private static func modDate(_ url: URL) -> Date? {
