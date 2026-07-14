@@ -375,8 +375,13 @@ final class GalleryModel: ObservableObject {
         // multi-clip scenes span cameras, so let COLMAP solve intrinsics per image.
         let videoCount = sources.filter { $0.mediaType == .video }.count
         let sharedCamera = videoCount == 0 || (videoCount == 1 && sources.count == 1)
+        // Video frames are temporally ordered, so a video-only scene can use
+        // COLMAP's O(n) sequential matcher (right for walk-throughs) instead of
+        // exhaustive. Photo groups aren't ordered, so they stay exhaustive.
+        let sequentialMatching = !sources.isEmpty && videoCount == sources.count
         startSceneReconstruction(key: key, title: Self.sceneTitle(for: sources),
-                                 options: options, hero: hero, sharedCamera: sharedCamera) { imagesDir, report in
+                                 options: options, hero: hero, sharedCamera: sharedCamera,
+                                 sequentialMatching: sequentialMatching) { imagesDir, report in
             await self.selectAndWriteFrames(from: sources, to: imagesDir, report: report)
         }
     }
@@ -443,6 +448,7 @@ final class GalleryModel: ObservableObject {
     /// navigation; `sceneProgress` tracks it independently of `opened`.
     private func startSceneReconstruction(
         key: String, title: String, options: SceneOptions, hero: PHAsset, sharedCamera: Bool = true,
+        sequentialMatching: Bool = false,
         prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
     ) {
         let destination = splatURL(for: key)
@@ -512,7 +518,8 @@ final class GalleryModel: ObservableObject {
 
                 // COLMAP + training: the remaining 95%.
                 try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination,
-                                      totalImages: written, sharedCamera: sharedCamera) { update in
+                                      totalImages: written, sharedCamera: sharedCamera,
+                                      sequentialMatching: sequentialMatching) { update in
                     Task { @MainActor in
                         guard self.sceneProgress?.key == key else { return }
                         self.sceneProgress?.stageLabel = update.stageLabel
@@ -561,9 +568,14 @@ final class GalleryModel: ObservableObject {
     private func selectAndWriteFrames(from sources: [PHAsset], to dir: URL,
                                       report: @escaping (String, Double) -> Void) async -> Int {
         let videoCount = sources.filter { $0.mediaType == .video }.count
+        // Video-only scenes match sequentially (O(n)) so they can afford many
+        // frames; scenes with any photos match exhaustively (O(n²)) and stay lean.
+        let videoOnly = !sources.isEmpty && videoCount == sources.count
+        let maxPerVideo = videoOnly ? FrameSelection.maxFramesPerVideo
+                                    : FrameSelection.maxFramesPerVideoWithPhotos
         let perVideoBudget = videoCount > 0
             ? max(FrameSelection.minFramesPerVideo,
-                  min(FrameSelection.maxFramesPerVideo, FrameSelection.totalFrameBudget / videoCount))
+                  min(maxPerVideo, FrameSelection.totalFrameBudget / videoCount))
             : 0
         let noun = sources.count == 1 ? "source" : "sources"
 
@@ -614,16 +626,21 @@ final class GalleryModel: ObservableObject {
         }
     }
 
-    /// Sample a video, drop the blurriest and badly-exposed frames, and return up
-    /// to `budget` well-exposed frames evenly spread across time (temporal spread
-    /// matters more to SfM than picking only the single sharpest moments). A cheap
-    /// low-res pass scores; the chosen times are re-rendered at full resolution.
+    /// Sample a video, drop the blurriest and badly-exposed frames, and return
+    /// well-exposed frames evenly spread across time (temporal spread matters more
+    /// to SfM than picking only the single sharpest moments). The count scales
+    /// with clip length at ~`sampleFPS`, capped by `budget`. A cheap low-res pass
+    /// scores; the chosen times are re-rendered at full resolution.
     nonisolated static func selectVideoFrames(from avAsset: AVAsset, budget: Int) async -> [CGImage] {
         guard budget > 0, let duration = try? await avAsset.load(.duration) else { return [] }
         let seconds = CMTimeGetSeconds(duration)
         guard seconds.isFinite, seconds > 0 else { return [] }
         let fpsSamples = Int((seconds * FrameSelection.sampleFPS).rounded())
-        let sampleCount = min(FrameSelection.maxVideoSamples, max(budget, fpsSamples))
+        // Final frame count: ~3 fps worth, scaled by length, capped by the budget.
+        let target = min(budget, max(FrameSelection.minFramesPerVideo, fpsSamples))
+        // Score around that many candidates (never fewer than the target so culling
+        // has slack), bounded by the scoring ceiling.
+        let sampleCount = min(FrameSelection.maxVideoSamples, max(target, fpsSamples))
 
         // Pass 1: cheap low-res scoring to find sharp, well-exposed times.
         let scorer = makeGenerator(avAsset, maxDimension: 480)
@@ -640,14 +657,14 @@ final class GalleryModel: ObservableObject {
         let median = scored.map(\.sharpness).sorted()[scored.count / 2]
         let ordered = scored.filter { $0.sharpness >= median * FrameSelection.relativeSharpnessFloor }
                             .sorted { $0.t < $1.t }
-        // …then evenly subsample the survivors to the budget, preserving spread.
+        // …then evenly subsample the survivors to the target, preserving spread.
         var times: [Double] = []
-        if ordered.count <= budget {
+        if ordered.count <= target {
             times = ordered.map(\.t)
         } else {
             let count = Double(ordered.count)
-            let slots = Double(budget)
-            for k in 0..<budget {
+            let slots = Double(target)
+            for k in 0..<target {
                 let position: Double = (Double(k) + 0.5) * count / slots
                 let idx = min(Int(position), ordered.count - 1)
                 times.append(ordered[idx].t)

@@ -16,13 +16,16 @@ enum FrameSelection {
     /// threshold).
     static let relativeSharpnessFloor = 0.5
 
-    /// ~3 fps video sampling, plus per-video and total frame budgets. Caps keep
-    /// COLMAP's O(n²) matching tractable while leaving enough overlap to register.
+    /// ~3 fps video sampling. Video-only scenes match with COLMAP's O(n)
+    /// sequential matcher, so their frame count scales with clip length up to a
+    /// generous cap; scenes that also contain photos fall back to the O(n²)
+    /// exhaustive matcher and stay conservative to keep matching tractable.
     static let sampleFPS = 3.0
-    static let maxVideoSamples = 72       // oversampling ceiling for scoring
+    static let maxVideoSamples = 450      // scoring ceiling (enough for long clips)
     static let minFramesPerVideo = 15
-    static let maxFramesPerVideo = 48
-    static let totalFrameBudget = 120
+    static let maxFramesPerVideo = 300         // per video, sequential matching
+    static let maxFramesPerVideoWithPhotos = 48  // per video, exhaustive matching
+    static let totalFrameBudget = 360     // cap summed across all videos in a scene
 
     /// Working size for the downscale everything is scored on.
     private static let workingSize = 256

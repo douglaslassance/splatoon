@@ -123,6 +123,7 @@ final class MultiImageReconstructor {
     /// a stage label and an overall 0...1 fraction across the whole pipeline
     /// (dispatch to the UI is the caller's job).
     func run(imagesDir: URL, workDir: URL, output: URL, totalImages: Int, sharedCamera: Bool = true,
+            sequentialMatching: Bool = false,
             progress: @escaping (ReconstructionProgress) -> Void) throws {
         // An orphaned subprocess from a previous run (app crashed, was
         // force-quit, or updated mid-reconstruction) doesn't die with its
@@ -164,7 +165,10 @@ final class MultiImageReconstructor {
         let extractGPU = gpuFlag(subcommand: "feature_extractor",
                                  preferred: "--FeatureExtraction.use_gpu",
                                  legacy: "--SiftExtraction.use_gpu")
-        let matchGPU = gpuFlag(subcommand: "exhaustive_matcher",
+        // Sequential matching (temporal neighbours, O(n)) suits ordered video
+        // frames; exhaustive (all pairs, O(n²)) is needed for unordered photos.
+        let matcher = sequentialMatching ? "sequential_matcher" : "exhaustive_matcher"
+        let matchGPU = gpuFlag(subcommand: matcher,
                                preferred: "--FeatureMatching.use_gpu",
                                legacy: "--SiftMatching.use_gpu")
 
@@ -182,14 +186,15 @@ final class MultiImageReconstructor {
             report(bands[0], within: n / total)
         }
 
-        // 2. Match features across all image pairs.
+        // 2. Match features. Exhaustive reports "Processing block [n/total]";
+        // sequential reports "Matching image [n/total]" — parse either for progress.
         report(bands[1], within: 0)
         try runTool(colmap, stage: "matching", workDir: workDir, args: [
-            "exhaustive_matcher",
+            matcher,
             "--database_path", databaseURL.path,
             matchGPU, "0",
         ]) { line in
-            guard let caps = Self.captures(#"Processing block \[(\d+)/(\d+),"#, in: line),
+            guard let caps = Self.captures(#"(?:Processing block|Matching image) \[(\d+)/(\d+)"#, in: line),
                   let n = Double(caps[0]), let total = Double(caps[1]), total > 0 else { return }
             report(bands[1], within: n / total)
         }
