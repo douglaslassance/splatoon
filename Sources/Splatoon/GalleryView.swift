@@ -17,7 +17,9 @@ struct GalleryView: View {
                         .onTapGesture(count: 2) {
                             model.open(asset, allowMultiImage: settings.useMultiImageReconstruction,
                                       options: settings.sceneOptions,
-                                      matchMode: settings.sceneMatchMode)
+                                      matchMode: settings.sceneMatchMode,
+                                      singleImageGenerator: settings.singleImageGenerator,
+                                      triposplatGaussians: Int(settings.triposplatGaussians))
                         }
                         .help("Double-click to open its 3D splat")
                         .contextMenu {

@@ -67,6 +67,33 @@ enum MeshMethod: String, CaseIterable, Identifiable {
     }
 }
 
+/// How a single photo becomes a splat. SHARP is a fast on-device CoreML model
+/// that produces a 2.5D relief (only the visible surface); TripoSplat is a
+/// generative model (the `tripo-cli` tool) that produces a complete 3D object,
+/// hallucinating the unseen back and sides — slower, and object-centric.
+enum SingleImageGenerator: String, CaseIterable, Identifiable {
+    case sharp
+    case triposplat
+
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .sharp:      return "SHARP (fast relief)"
+        case .triposplat: return "TripoSplat (full 3D object)"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .sharp:
+            return "Fast on-device model. Produces a 2.5D relief of the photo's visible surface — great for "
+                + "scenes and quick results."
+        case .triposplat:
+            return "Generative model that builds a complete 3D object from one photo, inventing the unseen "
+                + "sides. Best for a single object; needs the tripo-cli tool and takes a couple of minutes."
+        }
+    }
+}
+
 /// The Gaussian-splat trainer the multi-image pipeline uses. Both consume the
 /// same COLMAP project and produce a standard 3DGS PLY; they differ in backend.
 enum SplatTrainer: String, CaseIterable, Identifiable {
@@ -128,6 +155,16 @@ final class MeshSettings: ObservableObject {
     /// default), or same place across any day (needs GPS).
     @Published var sceneMatchMode: SceneGrouping.MatchMode {
         didSet { defaults.set(sceneMatchMode.rawValue, forKey: Keys.sceneMatchMode) }
+    }
+    /// Which generator turns a single photo into a splat: SHARP (fast relief) or
+    /// TripoSplat (full 3D object via tripo-cli).
+    @Published var singleImageGenerator: SingleImageGenerator {
+        didSet { defaults.set(singleImageGenerator.rawValue, forKey: Keys.singleImageGenerator) }
+    }
+    /// TripoSplat: number of Gaussians to generate (more = more detail, larger,
+    /// slightly slower). Up to 262144.
+    @Published var triposplatGaussians: Double {
+        didSet { defaults.set(triposplatGaussians, forKey: Keys.triposplatGaussians) }
     }
     /// Training steps for the multi-image (COLMAP + OpenSplat) trainer. Too few
     /// and densification never fires (see OpenSplat's warmup-length, 500 steps);
@@ -235,6 +272,8 @@ final class MeshSettings: ObservableObject {
     private enum Keys {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
         static let sceneMatchMode = "reconstruction.sceneMatchMode"
+        static let singleImageGenerator = "generation.singleImageGenerator"
+        static let triposplatGaussians = "generation.triposplatGaussians"
         static let multiImageIterations = "reconstruction.multiImageIterations"
         static let sceneSHDegree = "reconstruction.sceneSHDegree"
         static let useGlobalPoseSolver = "reconstruction.useGlobalPoseSolver"
@@ -256,6 +295,9 @@ final class MeshSettings: ObservableObject {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
         sceneMatchMode = SceneGrouping.MatchMode(rawValue: defaults.string(forKey: Keys.sceneMatchMode) ?? "")
             ?? .timeAndLocation
+        singleImageGenerator = SingleImageGenerator(rawValue: defaults.string(forKey: Keys.singleImageGenerator) ?? "")
+            ?? .sharp
+        triposplatGaussians = defaults.object(forKey: Keys.triposplatGaussians) as? Double ?? 131072
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { $0 >= 3 ? 3 : 0 } ?? 0
         // Default on: the global SfM solver registers cameras far more reliably than

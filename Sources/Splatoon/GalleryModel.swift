@@ -6,6 +6,7 @@ import CoreImage
 import CoreGraphics
 import AVFoundation
 import UniformTypeIdentifiers
+import simd
 
 /// One shared, reused CIContext. Creating a CIContext per image (as this code
 /// used to) is a documented anti-pattern — each allocates Metal resources and an
@@ -102,6 +103,8 @@ final class GalleryModel: ObservableObject {
     private var cachedRunner: SharpModelRunner?
     private var cachedRunnerURL: URL?
     private var sceneReconstructor: MultiImageReconstructor?
+    /// The running TripoSplat generation, so a new request / cancel can stop it.
+    private var tripoRunner: TripoSplatRunner?
 
     init() {
         cacheDir = SplatCache.directory
@@ -178,7 +181,10 @@ final class GalleryModel: ObservableObject {
     // MARK: - Cache
 
     func hasSplat(_ asset: PHAsset) -> Bool {
-        splatIdentifiers.contains(asset.localIdentifier)
+        // A TripoSplat splat is keyed `<id>-tripo<N>`, so match the bare id or that
+        // prefix, and the badge lights for either generator.
+        let id = asset.localIdentifier
+        return splatIdentifiers.contains { $0 == id || $0.hasPrefix(id + "-tripo") }
     }
 
     private func splatURL(for identifier: String) -> URL {
@@ -205,7 +211,9 @@ final class GalleryModel: ObservableObject {
     func open(_ asset: PHAsset, allowMultiImage: Bool = true,
               options: SceneOptions = SceneOptions(iterations: 15000, shDegree: 1,
                                                    globalPoseSolver: false, trainer: .openSplat),
-              matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
+              matchMode: SceneGrouping.MatchMode = .timeAndLocation,
+              singleImageGenerator: SingleImageGenerator = .sharp,
+              triposplatGaussians: Int = 131072) {
         errorMessage = nil
         resetOpenedMesh()
 
@@ -225,26 +233,39 @@ final class GalleryModel: ObservableObject {
             return
         }
 
-        let identifier = asset.localIdentifier
+        // TripoSplat (full 3D object) needs its tool; if the user picked it but it
+        // isn't installed, fall back to SHARP (the Settings option is greyed out
+        // when unavailable, so this only happens if the tool was removed). Its
+        // output caches under a distinct key so it never collides with the SHARP
+        // splat of the same photo, and changing the Gaussian count regenerates.
+        let useTripo = singleImageGenerator == .triposplat && ToolLocator.tripoSplatAvailable
+        let identifier = asset.localIdentifier + (useTripo ? "-tripo\(triposplatGaussians)" : "")
         let destination = splatURL(for: identifier)
         let title = Self.title(for: asset)
         sourceForOpened[identifier] = asset
 
         if FileManager.default.fileExists(atPath: destination.path) {
-            opened = OpenedSplat(id: identifier, title: title, url: destination)
+            opened = OpenedSplat(id: identifier, title: title, url: destination,
+                                 initialPose: useTripo ? Self.tripoFramingPose(for: destination) : nil)
             return
         }
 
-        guard let modelURL = ModelLocator.resolveModelURL() else {
-            errorMessage = "No SHARP model found. Run scripts/fetch-model.sh, then choose sharp.mlpackage."
-            return
+        // SHARP needs its CoreML model resolved before we commit to generating.
+        var sharpModelURL: URL?
+        if !useTripo {
+            guard let modelURL = ModelLocator.resolveModelURL() else {
+                errorMessage = "No SHARP model found. Run scripts/fetch-model.sh, then choose sharp.mlpackage."
+                return
+            }
+            sharpModelURL = modelURL
         }
 
         // Switch to the splat view immediately (url nil = still generating);
-        // progress shows in the docked bar, same as multi-image scenes.
+        // progress shows in the docked bar, same as multi-image scenes. TripoSplat
+        // takes minutes, so it's cancellable; SHARP is too fast to bother.
         opened = OpenedSplat(id: identifier, title: title, url: nil)
         sceneProgress = SceneProgress(key: identifier, title: title, stageLabel: "Loading photo…",
-                                      fraction: 0.05, isScene: false, cancellable: false)
+                                      fraction: 0.05, isScene: false, cancellable: useTripo)
         buildStartedAt[identifier] = Date()
         let requestOptions = PHImageRequestOptions()
         requestOptions.isNetworkAccessAllowed = true
@@ -258,11 +279,13 @@ final class GalleryModel: ObservableObject {
                     self.failGeneration(key: identifier, message: "Could not load that photo.")
                     return
                 }
-                self.generate(cgImage: cgImage,
-                              identifier: identifier,
-                              title: title,
-                              modelURL: modelURL,
-                              destination: destination)
+                if useTripo {
+                    self.generateTripo(cgImage: cgImage, identifier: identifier, title: title,
+                                       destination: destination, gaussians: triposplatGaussians)
+                } else {
+                    self.generate(cgImage: cgImage, identifier: identifier, title: title,
+                                  modelURL: sharpModelURL!, destination: destination)
+                }
             }
         }
     }
@@ -316,6 +339,83 @@ final class GalleryModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Generate a single-image splat with TripoSplat (via the tripo-cli tool):
+    /// write the photo to a temp file, run the tool with staged/cancellable
+    /// progress, then open the resulting full 3D object framed from outside.
+    private func generateTripo(cgImage: CGImage, identifier: String, title: String,
+                               destination: URL, gaussians: Int) {
+        guard let runner = TripoSplatRunner() else {
+            failGeneration(key: identifier, message: "TripoSplat needs the tripo-cli tool "
+                + "(install uv, then `uv tool install tripo-cli`).")
+            return
+        }
+        runner.gaussians = gaussians
+        tripoRunner = runner
+        let start = Date()
+        Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let workDir = fm.temporaryDirectory
+                .appendingPathComponent("Splatoon/tripo-\(identifier.hashValue)", isDirectory: true)
+            let imageURL = workDir.appendingPathComponent("input.jpg")
+            do {
+                try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+                guard Self.writeJPEG(cgImage, to: imageURL) else { throw TripoSplatRunner.RunError.noOutput }
+                try runner.run(imagePath: imageURL, output: destination, workDir: workDir) { label, fraction in
+                    Task { @MainActor in
+                        guard self.sceneProgress?.key == identifier else { return }
+                        self.sceneProgress?.stageLabel = label
+                        self.sceneProgress?.fraction = fraction
+                    }
+                }
+                let pose = Self.tripoFramingPose(for: destination)
+                try? fm.removeItem(at: workDir)
+                await MainActor.run {
+                    self.tripoRunner = nil
+                    self.splatIdentifiers.insert(identifier)
+                    if self.opened?.id == identifier {
+                        self.opened = OpenedSplat(id: identifier, title: title, url: destination, initialPose: pose)
+                    }
+                    _ = start   // elapsed handled by completeGeneration
+                    self.completeGeneration(key: identifier, title: title, isScene: false)
+                }
+            } catch {
+                await MainActor.run {
+                    self.tripoRunner = nil
+                    if case TripoSplatRunner.RunError.cancelled = error {
+                        self.sceneProgress = nil
+                        if self.opened?.id == identifier { self.opened = nil }
+                    } else {
+                        self.failGeneration(key: identifier, message: error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A three-quarter framing pose for a TripoSplat object: it's a complete object
+    /// centred near the origin (unlike SHARP's "eye = the photo"), so opening at the
+    /// origin would put the camera inside it. Reads the PLY bounds and frames it
+    /// from outside, in the same flipped space the viewer renders in.
+    private nonisolated static func tripoFramingPose(for plyURL: URL) -> ScenePose? {
+        guard let g = try? SplatPLYReader.readGaussians(from: plyURL), g.count > 0 else { return nil }
+        let meanPtr = g.meanVectors.dataPointer.assumingMemoryBound(to: Float.self)
+        var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for i in 0..<g.count {
+            let p = SIMD3(meanPtr[i * 3 + 0], meanPtr[i * 3 + 1], meanPtr[i * 3 + 2])
+            mn = simd_min(mn, p); mx = simd_max(mx, p)
+        }
+        // OpenCV -> viewer space (x, -y, -z); flip is a rotation, so extent is preserved.
+        func flip(_ v: SIMD3<Float>) -> SIMD3<Float> { SIMD3(v.x, -v.y, -v.z) }
+        let center = flip((mn + mx) / 2)
+        let radius = max(simd_length((mx - mn) / 2), 1e-3)
+        let eye = center + simd_normalize(SIMD3<Float>(0.6, 0.4, 1.0)) * (radius * 2.6)
+        let forward = simd_normalize(center - eye)
+        let pitch = asin(max(-1, min(1, forward.y)))
+        let yaw = atan2(forward.x, -forward.z)
+        return ScenePose(eye: eye, yaw: yaw, pitch: pitch, fovyDegrees: 45)
     }
 
     // MARK: - Generation progress (shared by single- and multi-image)
@@ -376,6 +476,7 @@ final class GalleryModel: ObservableObject {
     func cancelSceneReconstruction() {
         sceneReconstructor?.cancel()
         photogrammetryMesher?.cancel()
+        tripoRunner?.cancel()
     }
 
     /// Bring the scene tracked by `sceneProgress` back on screen — either its

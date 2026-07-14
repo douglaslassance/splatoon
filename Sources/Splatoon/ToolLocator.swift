@@ -21,6 +21,9 @@ enum ReconstructionTool: String, CaseIterable {
     case reconstructMesh
     case refineMesh
     case textureMesh
+    /// The `tripo-cli` wrapper (single image -> 3D Gaussian object via TripoSplat),
+    /// installed with `uv tool install`. Opt-in; not in `required`.
+    case tripoSplat
 
     /// The tools the pipeline always needs (COLMAP + the default trainer). Brush
     /// and the OpenMVS tools are opt-in, so they're excluded.
@@ -43,6 +46,7 @@ enum ReconstructionTool: String, CaseIterable {
         case .reconstructMesh:   return "OpenMVS ReconstructMesh"
         case .refineMesh:        return "OpenMVS RefineMesh"
         case .textureMesh:       return "OpenMVS TextureMesh"
+        case .tripoSplat:        return "TripoSplat CLI"
         }
     }
 
@@ -59,6 +63,7 @@ enum ReconstructionTool: String, CaseIterable {
         case .reconstructMesh:   return "ReconstructMesh"
         case .refineMesh:        return "RefineMesh"
         case .textureMesh:       return "TextureMesh"
+        case .tripoSplat:        return "tripo-cli"
         }
     }
 
@@ -72,6 +77,8 @@ enum ReconstructionTool: String, CaseIterable {
         case .brush:     return "Install with `cargo install --git https://github.com/ArthurBrussee/brush brush-cli`, or run scripts/fetch-tools.sh."
         case .interfaceCOLMAP, .densifyPointCloud, .reconstructMesh, .refineMesh, .textureMesh:
             return "Build OpenMVS via scripts/fetch-tools.sh (for the photogrammetry mesh)."
+        case .tripoSplat:
+            return "Install uv, then `uv tool install tripo-cli` and `tripo-cli download` (for single-image 3D objects)."
         }
     }
 }
@@ -100,10 +107,13 @@ enum ToolLocator {
             let bundled = resources.appendingPathComponent("bin/\(tool.binaryName)")
             if fm.isExecutableFile(atPath: bundled.path) { return bundled }
         }
-        // ~/.cargo/bin is where `cargo install` drops Brush; the rest are the
-        // usual Homebrew/system locations.
-        let cargoBin = fm.homeDirectoryForCurrentUser.appendingPathComponent(".cargo/bin").path
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", cargoBin] {
+        // ~/.cargo/bin is where `cargo install` drops Brush; ~/.local/bin is where
+        // `uv tool install` drops tripo-cli; the rest are the usual Homebrew/system
+        // locations.
+        let home = fm.homeDirectoryForCurrentUser
+        let cargoBin = home.appendingPathComponent(".cargo/bin").path
+        let uvToolBin = home.appendingPathComponent(".local/bin").path
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", cargoBin, uvToolBin] {
             let candidate = "\(dir)/\(tool.binaryName)"
             if fm.isExecutableFile(atPath: candidate) { return URL(fileURLWithPath: candidate) }
         }
@@ -119,6 +129,11 @@ enum ToolLocator {
     static var photogrammetryAvailable: Bool {
         resolvedURL(for: .colmap) != nil
             && ReconstructionTool.openMVS.allSatisfy { resolvedURL(for: $0) != nil }
+    }
+
+    /// Whether the TripoSplat single-image generator (the `tripo-cli` tool) resolves.
+    static var tripoSplatAvailable: Bool {
+        resolvedURL(for: .tripoSplat) != nil
     }
 
     /// Resolve, prompting the user to locate the binary if it isn't found. Must

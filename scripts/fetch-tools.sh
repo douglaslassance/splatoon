@@ -145,9 +145,29 @@ for bin in InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureM
   if [ -n "$found" ]; then echo "==> Installing $bin -> $DEST/$bin"; cp "$found" "$DEST/$bin"; fi
 done
 
+# --- TripoSplat CLI (optional, single-image 3D object generator) -------------
+# The "TripoSplat" single-image generator turns one photo into a complete 3D
+# object (vs SHARP's 2.5D relief). It's a Python/PyTorch tool installed with uv
+# as an isolated CLI on PATH (~/.local/bin, on Splatoon's search path). Weights
+# (~3.8 GB) are fetched separately with `tripo-cli download`.
+echo "==> Installing TripoSplat CLI (optional, single-image 3D objects)"
+if ! command -v uv >/dev/null 2>&1; then
+  echo "==> Installing uv"; brew list uv >/dev/null 2>&1 || brew install uv
+fi
+TRIPO_CLI_DIR="$(cd "$(dirname "$0")/../../tripo-cli" 2>/dev/null && pwd || true)"
+if [ -n "$TRIPO_CLI_DIR" ] && [ -f "$TRIPO_CLI_DIR/pyproject.toml" ]; then
+  uv tool install --force "$TRIPO_CLI_DIR"
+  echo "==> Fetching TripoSplat weights (~3.8 GB)"
+  tripo-cli download
+else
+  echo "==> Skipping TripoSplat: ../tripo-cli not found next to the Splatoon repo." >&2
+  echo "    Clone it, then run: uv tool install <path-to-tripo-cli> && tripo-cli download" >&2
+fi
+
 echo ""
 echo "Done."
 echo "  COLMAP:    $(command -v colmap)"
 echo "  OpenSplat: $DEST/opensplat"
 echo "  OpenMVS:   $DEST/DensifyPointCloud (+ ReconstructMesh, TextureMesh, …)"
+echo "  TripoSplat: $(command -v tripo-cli || echo 'not installed')"
 echo "Open a photo that has several same-place/time siblings to reconstruct a scene."

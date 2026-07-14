@@ -22,10 +22,61 @@ struct SettingsView: View {
 
     private var singleImageTab: some View {
         VStack(alignment: .leading, spacing: 16) {
+            generatorCard
             methodCard(selection: $settings.singleImageMethod, cases: MeshMethod.singleImageCases)
             optionsCard(for: settings.singleImageMethod)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Chooses how a single photo becomes a splat: SHARP (fast relief) or
+    /// TripoSplat (full 3D object). The TripoSplat row is greyed out when the
+    /// `tripo-cli` tool isn't installed.
+    private var generatorCard: some View {
+        let triposplatAvailable = ToolLocator.tripoSplatAvailable
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(SingleImageGenerator.allCases) { gen in
+                    let disabled = (gen == .triposplat && !triposplatAvailable)
+                    Button {
+                        settings.singleImageGenerator = gen
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: settings.singleImageGenerator == gen
+                                  ? "largecircle.fill.circle" : "circle")
+                            Text(gen.displayName)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled)
+                    .foregroundStyle(disabled ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                }
+
+                Text(settings.singleImageGenerator.detail)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !triposplatAvailable {
+                    Label("TripoSplat needs the tripo-cli tool: install uv, then "
+                          + "`uv tool install tripo-cli` and `tripo-cli download`.",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if settings.singleImageGenerator == .triposplat {
+                    sliderRow(title: "Gaussians",
+                              valueText: "\(Int(settings.triposplatGaussians))",
+                              value: $settings.triposplatGaussians, range: 32768...262144, step: 32768,
+                              caption: "How many Gaussians TripoSplat generates. More gives finer detail and a "
+                                + "larger file, at a little more time.")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(6)
+        } label: {
+            Text("Generator").font(.headline)
+        }
     }
 
     private var multiImageTab: some View {
