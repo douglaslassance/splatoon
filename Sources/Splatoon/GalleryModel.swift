@@ -406,15 +406,12 @@ final class GalleryModel: ObservableObject {
         // multi-clip scenes span cameras, so let COLMAP solve intrinsics per image.
         let videoCount = sources.filter { $0.mediaType == .video }.count
         let sharedCamera = videoCount == 0 || (videoCount == 1 && sources.count == 1)
-        // Video frames are temporally ordered, so a video-only scene can use
-        // COLMAP's O(n) sequential matcher (right for walk-throughs) instead of
-        // exhaustive. Photo groups aren't ordered, so they stay exhaustive.
-        let sequentialMatching = !sources.isEmpty && videoCount == sources.count
+        // The reconstructor infers its matching strategy (sequential / exhaustive /
+        // hybrid) from the prepared frame filenames — see MultiImageReconstructor.
         // Title the scene by the asset the user opened (its filename), matching
         // the single-image convention, rather than a generic "Scene · N photos".
         startSceneReconstruction(key: key, title: Self.title(for: hero),
-                                 options: options, hero: hero, sharedCamera: sharedCamera,
-                                 sequentialMatching: sequentialMatching) { imagesDir, report in
+                                 options: options, hero: hero, sharedCamera: sharedCamera) { imagesDir, report in
             await self.selectAndWriteFrames(from: sources, to: imagesDir, report: report)
         }
     }
@@ -472,7 +469,6 @@ final class GalleryModel: ObservableObject {
     /// navigation; `sceneProgress` tracks it independently of `opened`.
     private func startSceneReconstruction(
         key: String, title: String, options: SceneOptions, hero: PHAsset, sharedCamera: Bool = true,
-        sequentialMatching: Bool = false,
         prepare: @escaping (_ imagesDir: URL, _ report: @escaping (String, Double) -> Void) async -> Int
     ) {
         let destination = splatURL(for: key)
@@ -542,8 +538,7 @@ final class GalleryModel: ObservableObject {
 
                 // COLMAP + training: the remaining 95%.
                 try reconstructor.run(imagesDir: imagesDir, workDir: workDir, output: destination,
-                                      totalImages: written, sharedCamera: sharedCamera,
-                                      sequentialMatching: sequentialMatching) { update in
+                                      totalImages: written, sharedCamera: sharedCamera) { update in
                     Task { @MainActor in
                         guard self.sceneProgress?.key == key else { return }
                         self.sceneProgress?.stageLabel = update.stageLabel
@@ -592,21 +587,17 @@ final class GalleryModel: ObservableObject {
     private func selectAndWriteFrames(from sources: [PHAsset], to dir: URL,
                                       report: @escaping (String, Double) -> Void) async -> Int {
         let videoCount = sources.filter { $0.mediaType == .video }.count
-        // Video-only scenes match sequentially (O(n)) so they can afford many
-        // frames; scenes with any photos match exhaustively (O(n²)) and stay lean.
-        let videoOnly = !sources.isEmpty && videoCount == sources.count
-        let maxPerVideo = videoOnly ? FrameSelection.maxFramesPerVideo
-                                    : FrameSelection.maxFramesPerVideoWithPhotos
         let perVideoBudget = videoCount > 0
             ? max(FrameSelection.minFramesPerVideo,
-                  min(maxPerVideo, FrameSelection.totalFrameBudget / videoCount))
+                  min(FrameSelection.maxFramesPerVideo, FrameSelection.totalFrameBudget / videoCount))
             : 0
         let noun = sources.count == 1 ? "source" : "sources"
 
         var written = 0
         for (sIndex, source) in sources.enumerated() {
+            let isVideo = source.mediaType == .video
             var frames: [CGImage] = []
-            if source.mediaType == .video {
+            if isVideo {
                 if let av = await avAsset(for: source) {
                     frames = await Self.selectVideoFrames(from: av, budget: perVideoBudget)
                 }
@@ -615,9 +606,14 @@ final class GalleryModel: ObservableObject {
                 // A photo is deliberate, so keep it unless it's near-black/blown.
                 frames = [image]
             }
-            for image in frames {
-                let url = dir.appendingPathComponent(String(format: "src%02d_%04d.jpg", sIndex, written))
-                if Self.writeJPEG(image, to: url) { written += 1 }
+            // Name so the reconstructor can tell a video's ordered frames
+            // (`vidNN-FFFFF`) from a standalone photo (`photoNN`) and pick its
+            // matching strategy accordingly (see MultiImageReconstructor.matchPlan).
+            for (frameIndex, image) in frames.enumerated() {
+                let name = isVideo
+                    ? String(format: "vid%02d-%05d.jpg", sIndex, frameIndex)
+                    : String(format: "photo%02d.jpg", sIndex)
+                if Self.writeJPEG(image, to: dir.appendingPathComponent(name)) { written += 1 }
             }
             report("Selecting frames from \(sources.count) \(noun)…",
                    Double(sIndex + 1) / Double(sources.count))

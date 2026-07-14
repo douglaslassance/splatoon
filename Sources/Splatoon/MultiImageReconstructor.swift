@@ -123,7 +123,6 @@ final class MultiImageReconstructor {
     /// a stage label and an overall 0...1 fraction across the whole pipeline
     /// (dispatch to the UI is the caller's job).
     func run(imagesDir: URL, workDir: URL, output: URL, totalImages: Int, sharedCamera: Bool = true,
-            sequentialMatching: Bool = false,
             progress: @escaping (ReconstructionProgress) -> Void) throws {
         // An orphaned subprocess from a previous run (app crashed, was
         // force-quit, or updated mid-reconstruction) doesn't die with its
@@ -165,10 +164,14 @@ final class MultiImageReconstructor {
         let extractGPU = gpuFlag(subcommand: "feature_extractor",
                                  preferred: "--FeatureExtraction.use_gpu",
                                  legacy: "--SiftExtraction.use_gpu")
-        // Sequential matching (temporal neighbours, O(n)) suits ordered video
-        // frames; exhaustive (all pairs, O(n²)) is needed for unordered photos.
-        let matcher = sequentialMatching ? "sequential_matcher" : "exhaustive_matcher"
-        let matchGPU = gpuFlag(subcommand: matcher,
+        // Pick a matching strategy from the prepared frames: sequential for a lone
+        // video (temporal neighbours, O(n)), exhaustive for unordered photos, or a
+        // custom pair list (video temporal + photos matched against everything)
+        // when the two are mixed — so reinforcing a video with photos keeps the
+        // cheap temporal matching instead of collapsing to O(n²).
+        let (plan, allNames) = Self.matchPlan(imagesDir: imagesDir)
+        let matchSubcommand = plan.subcommand
+        let matchGPU = gpuFlag(subcommand: matchSubcommand,
                                preferred: "--FeatureMatching.use_gpu",
                                legacy: "--SiftMatching.use_gpu")
 
@@ -186,14 +189,20 @@ final class MultiImageReconstructor {
             report(bands[0], within: n / total)
         }
 
-        // 2. Match features. Exhaustive reports "Processing block [n/total]";
-        // sequential reports "Matching image [n/total]" — parse either for progress.
+        // 2. Match features. The matchers print progress differently ("Processing
+        // block [n/total]", "Matching image [n/total]") — parse any for the bar.
         report(bands[1], within: 0)
-        try runTool(colmap, stage: "matching", workDir: workDir, args: [
-            matcher,
-            "--database_path", databaseURL.path,
-            matchGPU, "0",
-        ]) { line in
+        var matchArgs = [matchSubcommand, "--database_path", databaseURL.path]
+        if case .hybrid(let sequences, let photos) = plan {
+            // Video temporal pairs + every photo against every image, written to a
+            // list that `matches_importer` matches (bounded, unlike exhaustive).
+            let pairsURL = workDir.appendingPathComponent("match_pairs.txt")
+            try Self.writeMatchPairs(sequences: sequences, photos: photos, allNames: allNames,
+                                     overlap: 10, to: pairsURL)
+            matchArgs += ["--match_list_path", pairsURL.path]
+        }
+        matchArgs += [matchGPU, "0"]
+        try runTool(colmap, stage: "matching", workDir: workDir, args: matchArgs) { line in
             guard let caps = Self.captures(#"(?:Processing block|Matching image) \[(\d+)/(\d+)"#, in: line),
                   let n = Double(caps[0]), let total = Double(caps[1]), total > 0 else { return }
             report(bands[1], within: n / total)
@@ -950,6 +959,79 @@ final class MultiImageReconstructor {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Feature matching plan
+
+    /// How to match a scene's features, chosen from the prepared frame filenames
+    /// (`vidNN-FFFFF` = a video's ordered frames, `photoNN` = a standalone photo).
+    private enum MatchPlan {
+        case exhaustive                                        // unordered photos, or unknown names
+        case sequential                                        // a lone video's temporal chain
+        case hybrid(sequences: [[String]], photos: [String])   // videos + photos together
+
+        var subcommand: String {
+            switch self {
+            case .exhaustive: return "exhaustive_matcher"
+            case .sequential: return "sequential_matcher"
+            case .hybrid:     return "matches_importer"
+            }
+        }
+    }
+
+    /// Classify the prepared images and choose a matching strategy. Returns the
+    /// plan plus every image name (needed to match photos against everything).
+    /// Falls back to exhaustive for any unrecognized naming (e.g. selftest frames).
+    private static func matchPlan(imagesDir: URL) -> (plan: MatchPlan, allNames: [String]) {
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: imagesDir.path)) ?? [])
+            .filter { $0.lowercased().hasSuffix(".jpg") }.sorted()
+        var sequences: [Int: [String]] = [:]
+        var photos: [String] = []
+        var other = false
+        for name in names {
+            if let caps = captures(#"^vid(\d+)-\d+\.jpg$"#, in: name), let src = Int(caps[0]) {
+                sequences[src, default: []].append(name)
+            } else if captures(#"^photo\d+\.jpg$"#, in: name) != nil {
+                photos.append(name)
+            } else {
+                other = true
+            }
+        }
+        // Frame indices are zero-padded, so lexical order is temporal order.
+        for key in sequences.keys { sequences[key]?.sort() }
+        let orderedSequences = sequences.keys.sorted().compactMap { sequences[$0] }
+
+        let plan: MatchPlan
+        if other || orderedSequences.isEmpty {
+            plan = .exhaustive
+        } else if photos.isEmpty && orderedSequences.count == 1 {
+            plan = .sequential
+        } else {
+            plan = .hybrid(sequences: orderedSequences, photos: photos)
+        }
+        return (plan, names)
+    }
+
+    /// Write the `matches_importer` pair list: within each video, every frame
+    /// paired with its next `overlap` neighbours (temporal); plus every photo
+    /// paired with every other image (so photos connect wherever they overlap).
+    /// Pairs are deduplicated and order-normalized.
+    private static func writeMatchPairs(sequences: [[String]], photos: [String],
+                                        allNames: [String], overlap: Int, to url: URL) throws {
+        var pairs = Set<String>()
+        func add(_ a: String, _ b: String) {
+            guard a != b else { return }
+            pairs.insert(a < b ? "\(a) \(b)" : "\(b) \(a)")
+        }
+        for sequence in sequences {
+            for i in sequence.indices {
+                for j in (i + 1)..<min(i + 1 + overlap, sequence.count) { add(sequence[i], sequence[j]) }
+            }
+        }
+        for photo in photos {
+            for name in allNames { add(photo, name) }
+        }
+        try (pairs.sorted().joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Subprocess
