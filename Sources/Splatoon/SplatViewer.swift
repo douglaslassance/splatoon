@@ -101,7 +101,7 @@ final class CameraMTKView: MTKView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        coordinator?.dolly(Float(event.scrollingDeltaY))
+        coordinator?.scroll(Float(event.scrollingDeltaY))
     }
 
     override func magnify(with event: NSEvent) {
@@ -153,6 +153,9 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
     private var moveSpeed: Float = 8        // world units per second
     private var dollyScale: Float = 0.05    // world units per scroll unit
     private var panSensitivity: Float = 0.016   // world units per pixel dragged
+    /// Scroll-wheel tuning applied on top of the size-calibrated `moveSpeed`
+    /// while flying. Persists across loads so a chosen pace sticks.
+    private var moveSpeedMultiplier: Float = 1
 
     // ANSI key codes (physical positions, layout-independent).
     private enum Key {
@@ -176,6 +179,15 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
 
     func dolly(_ amount: Float) {
         eye += forwardVector * (amount * dollyScale)
+    }
+
+    /// Scroll wheel: while a movement key is held, tune the fly speed instead of
+    /// dollying — the familiar "adjust navigation sensitivity as you move"
+    /// gesture. Multiplicative so one notch feels the same at any scene scale;
+    /// clamped to a 0.1×…10× band around the calibrated base.
+    func scroll(_ amount: Float) {
+        guard !pressedKeys.isEmpty else { dolly(amount); return }
+        moveSpeedMultiplier = min(max(moveSpeedMultiplier * exp(amount * 0.02), 0.1), 10)
     }
 
     /// Scale fly-camera speeds to the splat's world size so movement feels the same
@@ -247,7 +259,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
         if pressedKeys.contains(Key.e) { move += worldUp }
         if pressedKeys.contains(Key.q) { move -= worldUp }
         if move != .zero {
-            eye += normalize(move) * (moveSpeed * Float(dt))
+            eye += normalize(move) * (moveSpeed * moveSpeedMultiplier * Float(dt))
         }
     }
 

@@ -131,6 +131,9 @@ struct MeshViewer: NSViewRepresentable {
         private var moveSpeed: Float = 8        // world units/sec, scaled to mesh size
         private var dollyScale: Float = 0.05    // per scroll unit, scaled to mesh size
         private var panSensitivity: Float = 0.016   // world units per pixel, scaled to mesh size
+        /// Scroll-wheel tuning applied on top of the size-calibrated `moveSpeed`
+        /// while flying. Persists across loads so a chosen pace sticks.
+        private var moveSpeedMultiplier: Float = 1
 
         private enum Key {
             static let w: UInt16 = 13, a: UInt16 = 0, s: UInt16 = 1, d: UInt16 = 2
@@ -198,6 +201,15 @@ struct MeshViewer: NSViewRepresentable {
 
         func dolly(_ amount: Float) { eye += forwardVector * (amount * dollyScale) }
 
+        /// Scroll wheel: while a movement key is held, tune the fly speed instead
+        /// of dollying — the familiar "adjust navigation sensitivity as you move"
+        /// gesture. Multiplicative so one notch feels the same at any scene scale;
+        /// clamped to a 0.1×…10× band around the calibrated base.
+        func scroll(_ amount: Float) {
+            guard !pressedKeys.isEmpty else { dolly(amount); return }
+            moveSpeedMultiplier = min(max(moveSpeedMultiplier * exp(amount * 0.02), 0.1), 10)
+        }
+
         /// Translate the camera along its screen-space right/up axes, right-drag —
         /// the mesh follows the cursor, like a grab-and-drag hand tool.
         func pan(deltaX: Float, deltaY: Float) {
@@ -246,7 +258,7 @@ struct MeshViewer: NSViewRepresentable {
                 if pressedKeys.contains(Key.a) { move -= right }
                 if pressedKeys.contains(Key.e) { move += worldUp }
                 if pressedKeys.contains(Key.q) { move -= worldUp }
-                if move != .zero { eye += normalize(move) * (moveSpeed * dt) }
+                if move != .zero { eye += normalize(move) * (moveSpeed * moveSpeedMultiplier * dt) }
             }
             applyCameraTransform()
         }
@@ -315,7 +327,7 @@ final class FlyCameraSCNView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        coordinator?.dolly(Float(event.scrollingDeltaY))
+        coordinator?.scroll(Float(event.scrollingDeltaY))
     }
 
     override func magnify(with event: NSEvent) {
