@@ -22,7 +22,7 @@ struct SettingsView: View {
 
     private var singleImageTab: some View {
         VStack(alignment: .leading, spacing: 16) {
-            methodCard(selection: $settings.singleImageMethod, cases: MeshMethod.allCases)
+            methodCard(selection: $settings.singleImageMethod, cases: MeshMethod.singleImageCases)
             optionsCard(for: settings.singleImageMethod)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -151,6 +151,47 @@ struct SettingsView: View {
     @ViewBuilder
     private func optionsCard(for method: MeshMethod) -> some View {
         switch method {
+        case .photogrammetry:
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !ToolLocator.photogrammetryAvailable {
+                        Label("OpenMVS isn't installed. Run scripts/fetch-tools.sh to enable photogrammetry.",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    sliderRow(title: "Detail",
+                              valueText: String(format: "%.0f%%", settings.photogrammetryQuality * 100),
+                              value: $settings.photogrammetryQuality, range: 0...1,
+                              caption: "How finely the dense stereo reconstructs. Higher resolves more detail from the photos but is markedly slower and heavier.")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Refine mesh", isOn: $settings.photogrammetryRefine)
+                        Text("Runs OpenMVS's extra photometric refinement pass for crisper geometry. Noticeably slower.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            } label: {
+                Text("Photogrammetry options").font(.headline)
+            }
+        case .fusion:
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    sliderRow(title: "Resolution",
+                              valueText: "\(Int(settings.poissonResolution))",
+                              value: $settings.poissonResolution, range: 128...4096, step: 128,
+                              caption: "Sets the voxel grid resolution the fused depth is meshed at. Higher means finer detail, at the cost of speed and file size.")
+                    sliderRow(title: "Max views",
+                              valueText: "\(Int(settings.fusionMaxViews))",
+                              value: $settings.fusionMaxViews, range: 4...200, step: 4,
+                              caption: "How many registered cameras to render and fuse, sampled evenly across the capture. More views give fuller coverage and less noise, but take proportionally longer.")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            } label: {
+                Text("Fusion options").font(.headline)
+            }
         case .density:
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {

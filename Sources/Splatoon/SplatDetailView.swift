@@ -29,7 +29,10 @@ struct SplatDetailView: View {
                                       surfelExtent: Float(settings.surfelExtent),
                                       poissonResolution: Int(settings.poissonResolution),
                                       surfaceTightness: Float(settings.surfaceTightness),
-                                      densityOffset: Float(settings.densityOffset))
+                                      densityOffset: Float(settings.densityOffset),
+                                      fusionMaxViews: Int(settings.fusionMaxViews),
+                                      photogrammetryResolutionLevel: settings.photogrammetryResolutionLevel,
+                                      photogrammetryRefine: settings.photogrammetryRefine)
             }
     }
 
@@ -40,10 +43,12 @@ struct SplatDetailView: View {
             SplatViewer(url: opened.url, initialPose: opened.initialPose,
                         onLoadingChange: { model.setSplatLoading($0) })
         case .mesh:
-            if let mesh = model.openedMesh {
+            if let objURL = model.openedTexturedMeshURL {
+                MeshViewer(objURL: objURL, initialPose: opened.initialPose)
+            } else if let mesh = model.openedMesh {
                 MeshViewer(mesh: mesh, initialPose: opened.initialPose)
             } else {
-                Color.clear   // the docked bar shows "Building mesh…"
+                Color.clear   // the docked bar shows the mesh-build progress
             }
         }
     }
@@ -121,13 +126,20 @@ struct SplatDetailView: View {
         case .splat:
             model.exportOpened()
         case .mesh:
-            model.exportMesh(method: settings.method(forScene: opened.isScene),
-                             smoothGrid: settings.smoothGrid,
-                             depthRatioCull: Float(settings.depthRatioCull),
-                             surfelExtent: Float(settings.surfelExtent),
-                             poissonResolution: Int(settings.poissonResolution),
-                             surfaceTightness: Float(settings.surfaceTightness),
-                             densityOffset: Float(settings.densityOffset))
+            // The photogrammetry mesh is a textured OBJ bundle, exported as-is;
+            // the other methods build and write a vertex-coloured .glb.
+            if model.openedTexturedMeshURL != nil {
+                model.exportTexturedMesh()
+            } else {
+                model.exportMesh(method: settings.method(forScene: opened.isScene),
+                                 smoothGrid: settings.smoothGrid,
+                                 depthRatioCull: Float(settings.depthRatioCull),
+                                 surfelExtent: Float(settings.surfelExtent),
+                                 poissonResolution: Int(settings.poissonResolution),
+                                 surfaceTightness: Float(settings.surfaceTightness),
+                                 densityOffset: Float(settings.densityOffset),
+                                 fusionMaxViews: Int(settings.fusionMaxViews))
+            }
         }
     }
 

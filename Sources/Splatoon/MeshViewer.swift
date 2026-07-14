@@ -11,15 +11,23 @@ import simd
 /// mesh size so the feel is consistent for both small SHARP meshes and larger
 /// multi-view scenes.
 struct MeshViewer: NSViewRepresentable {
-    /// The triangle mesh to display. Rebuilt only when its size changes so an
-    /// unrelated SwiftUI update doesn't reset the camera.
-    var mesh: Mesh
+    /// What to render: either an in-memory vertex-coloured `Mesh` (the on-device
+    /// meshers) or a textured `.obj` bundle on disk (the OpenMVS photogrammetry
+    /// mesh). Both share the same fly camera.
+    enum Source {
+        case mesh(Mesh)
+        case obj(URL)
+    }
+    var source: Source
     /// Where the camera starts (and returns to on R). Identical to `SplatViewer`'s
     /// pose: the mesh lives in the same flipped space `SplatViewer`'s calibration
     /// (a π rotation about X) renders the splat into — and `MeshExport`'s `flip`
     /// is that same rotation — so the pose transfers with no conversion. nil =
     /// world origin, the SHARP single-image "eye = the photo" convention.
     var initialPose: ScenePose?
+
+    init(mesh: Mesh, initialPose: ScenePose?) { self.source = .mesh(mesh); self.initialPose = initialPose }
+    init(objURL: URL, initialPose: ScenePose?) { self.source = .obj(objURL); self.initialPose = initialPose }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -30,16 +38,16 @@ struct MeshViewer: NSViewRepresentable {
         view.antialiasingMode = .multisampling4X
         view.rendersContinuously = true       // keep animating for smooth WASD movement
         view.isPlaying = true
-        context.coordinator.install(mesh, initialPose: initialPose, in: view)
+        context.coordinator.install(source, initialPose: initialPose, in: view)
         // Take keyboard focus so WASD works once the view is in a window.
         DispatchQueue.main.async { [weak view] in view?.window?.makeFirstResponder(view) }
         return view
     }
 
     func updateNSView(_ view: FlyCameraSCNView, context: Context) {
-        guard Self.signature(of: mesh) != context.coordinator.signature
+        guard Self.signature(of: source) != context.coordinator.signature
                 || initialPose != context.coordinator.installedPose else { return }
-        context.coordinator.install(mesh, initialPose: initialPose, in: view)
+        context.coordinator.install(source, initialPose: initialPose, in: view)
     }
 
     static func dismantleNSView(_ view: FlyCameraSCNView, coordinator: Coordinator) {
@@ -98,10 +106,56 @@ struct MeshViewer: NSViewRepresentable {
         return (center, max(simd_length(mx - center), 1e-3))
     }
 
-    /// Cheap change proxy: vertex and index counts. Enough to reframe on rebuild
-    /// while ignoring SwiftUI updates that leave the mesh untouched.
-    fileprivate static func signature(of mesh: Mesh) -> Int {
-        mesh.positions.count &* 1_000_003 &+ mesh.indices.count
+    /// World-space bounds (center, radius) of a loaded node hierarchy, unioning
+    /// every descendant geometry's box transformed by its world transform.
+    fileprivate static func worldBounds(of root: SCNNode) -> (center: SIMD3<Float>, radius: Float) {
+        var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        var found = false
+        func visit(_ n: SCNNode) {
+            if n.geometry != nil {
+                let (lo, hi) = n.boundingBox
+                let m = n.simdWorldTransform
+                for cx in [Float(lo.x), Float(hi.x)] {
+                    for cy in [Float(lo.y), Float(hi.y)] {
+                        for cz in [Float(lo.z), Float(hi.z)] {
+                            let w = m * SIMD4<Float>(cx, cy, cz, 1)
+                            let p = SIMD3(w.x, w.y, w.z)
+                            mn = simd_min(mn, p); mx = simd_max(mx, p); found = true
+                        }
+                    }
+                }
+            }
+            for c in n.childNodes { visit(c) }
+        }
+        visit(root)
+        guard found else { return (.zero, 1) }
+        let center = (mn + mx) / 2
+        return (center, max(simd_length(mx - center), 1e-3))
+    }
+
+    /// A generic three-quarter framing pose for a mesh with no meaningful camera
+    /// pose of its own (the OpenMVS OBJ), looking at its center from outside.
+    fileprivate static func framingPose(center: SIMD3<Float>, radius: Float) -> ScenePose {
+        let eye = center + simd_normalize(SIMD3<Float>(0.7, 0.4, 1.0)) * (radius * 2.4)
+        let forward = simd_normalize(center - eye)
+        let pitch = asin(max(-1, min(1, forward.y)))
+        let yaw = atan2(forward.x, -forward.z)
+        return ScenePose(eye: eye, yaw: yaw, pitch: pitch, fovyDegrees: 50)
+    }
+
+    /// Cheap change proxy so an unrelated SwiftUI update doesn't reset the camera:
+    /// vertex+index counts for a `Mesh`, path+mtime for an OBJ (a rebuilt file at
+    /// the same URL has a newer mtime).
+    fileprivate static func signature(of source: Source) -> Int {
+        switch source {
+        case .mesh(let mesh):
+            return mesh.positions.count &* 1_000_003 &+ mesh.indices.count
+        case .obj(let url):
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate?.timeIntervalSince1970 ?? 0
+            return url.path.hashValue &+ Int(mtime)
+        }
     }
 
     // MARK: - Fly camera (mirrors SplatViewerCoordinator)
@@ -140,20 +194,48 @@ struct MeshViewer: NSViewRepresentable {
             static let q: UInt16 = 12, e: UInt16 = 14, r: UInt16 = 15
         }
 
-        func install(_ mesh: Mesh, initialPose: ScenePose?, in view: SCNView) {
+        func install(_ source: MeshViewer.Source, initialPose: ScenePose?, in view: SCNView) {
             let scene = SCNScene()
-            let node = SCNNode(geometry: MeshViewer.geometry(from: mesh))
-            scene.rootNode.addChildNode(node)
-
-            let (center, radius) = MeshViewer.bounds(of: mesh.positions)
+            let center: SIMD3<Float>
+            let radius: Float
+            // For the vertex-coloured `Mesh` the splat's own pose transfers exactly
+            // (same flipped space), so we open at it. The OpenMVS OBJ lives in the
+            // raw COLMAP frame instead (not flipped/gravity-aligned), so that pose
+            // doesn't apply — frame it generically from its bounding box.
+            var pose = initialPose
+            switch source {
+            case .mesh(let mesh):
+                scene.rootNode.addChildNode(SCNNode(geometry: MeshViewer.geometry(from: mesh)))
+                (center, radius) = MeshViewer.bounds(of: mesh.positions)
+            case .obj(let url):
+                // OpenMVS emits the mesh in COLMAP's OpenCV frame (Y down). Wrap it
+                // in the same π-about-X flip the splat/mesh use so it comes in
+                // roughly upright (it isn't gravity-aligned, so this is approximate).
+                let flip = SCNNode()
+                var t = matrix_identity_float4x4
+                t.columns.1.y = -1; t.columns.2.z = -1
+                flip.simdTransform = t
+                if let loaded = try? SCNScene(url: url, options: [.createNormalsIfAbsent: true]) {
+                    for child in loaded.rootNode.childNodes { flip.addChildNode(child) }
+                    // The MTL materials are lit, but the scene has no lights (the
+                    // texture is already photometrically baked), so force them
+                    // fullbright — otherwise the whole mesh renders black.
+                    flip.enumerateHierarchy { node, _ in
+                        node.geometry?.materials.forEach { $0.lightingModel = .constant }
+                    }
+                }
+                scene.rootNode.addChildNode(flip)
+                (center, radius) = MeshViewer.worldBounds(of: scene.rootNode)
+                pose = MeshViewer.framingPose(center: center, radius: radius)
+            }
 
             // Start at the same viewpoint the splat opens from — the photo's own
             // camera — rather than a generic bounding-box angle, so toggling
             // Splat↔Mesh keeps the framing steady. nil = world origin (SHARP);
             // a registered camera pose for scenes.
-            if let initialPose {
-                eye = initialPose.eye; yaw = initialPose.yaw; pitch = initialPose.pitch
-                fovDegrees = initialPose.fovyDegrees
+            if let pose {
+                eye = pose.eye; yaw = pose.yaw; pitch = pose.pitch
+                fovDegrees = pose.fovyDegrees
             } else {
                 eye = .zero; yaw = 0; pitch = 0
                 fovDegrees = sharpFOVyDegrees
@@ -180,7 +262,7 @@ struct MeshViewer: NSViewRepresentable {
             applyCameraTransform()
             view.scene = scene
             view.pointOfView = camNode
-            signature = MeshViewer.signature(of: mesh)
+            signature = MeshViewer.signature(of: source)
             installedPose = initialPose
             startTimer()
         }

@@ -2,6 +2,13 @@ import SwiftUI
 
 /// The available mesh-generation strategies, shown in the Settings panel.
 enum MeshMethod: String, CaseIterable, Identifiable {
+    /// Full dense-MVS photogrammetry (COLMAP + OpenMVS) on the registered images:
+    /// a watertight, UV-textured mesh. The highest quality, but needs OpenMVS and
+    /// the scene's saved images, and takes minutes.
+    case photogrammetry
+    /// Multi-view TSDF depth fusion: render depth+colour from the trained splat at
+    /// each registered camera and fuse the depth maps into a surface.
+    case fusion
     /// Anisotropic Gaussian density field -> iso-surface (marching tetrahedra).
     case density
     /// Connect the Gaussian pixel grid into a 2.5D relief surface.
@@ -15,12 +22,20 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     /// Methods offered for multi-view scene splats. Grid needs SHARP's structured
     /// pixel grid, which scene (COLMAP + OpenSplat) splats don't have, so it's
-    /// excluded here. Density leads: it needs no normals, so it holds up best on
-    /// unstructured multi-view splats.
-    static let sceneCases: [MeshMethod] = [.density, .surfel, .poisson]
+    /// excluded here. Fusion leads: it renders the splat from the registered
+    /// cameras and fuses the depth maps, the same technique the good mesh
+    /// pipelines use, so it produces the cleanest surface.
+    static let sceneCases: [MeshMethod] = [.photogrammetry, .fusion, .density, .surfel, .poisson]
+
+    /// Methods offered for single-image (SHARP) splats. Photogrammetry and fusion
+    /// are excluded: they need multiple registered cameras, which a single photo
+    /// doesn't have.
+    static let singleImageCases: [MeshMethod] = [.grid, .density, .surfel, .poisson]
 
     var displayName: String {
         switch self {
+        case .photogrammetry: return "Photogrammetry (textured)"
+        case .fusion: return "Multi-view fusion"
         case .density: return "Anisotropic density"
         case .grid: return "Grid surface"
         case .surfel: return "Surfels (per-splat quads)"
@@ -30,6 +45,14 @@ enum MeshMethod: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
+        case .photogrammetry:
+            return "Runs full dense multi-view stereo (COLMAP + OpenMVS) on the scene's photos to build a "
+                + "watertight, UV-textured mesh — by far the best quality. Needs OpenMVS installed and the "
+                + "scene's saved images (regenerate older scenes), and takes minutes."
+        case .fusion:
+            return "Renders depth and colour from the splat at each registered camera, then fuses the "
+                + "depth maps (TSDF) into a watertight, vertex-coloured surface. The most accurate on "
+                + "multi-image scenes; needs the scene's camera poses."
         case .density:
             return "Builds a density field from each splat's shape and extracts a smooth iso-surface. "
                 + "Uses no normals, so it's the most reliable on multi-image scenes."
@@ -151,9 +174,15 @@ final class MeshSettings: ObservableObject {
     @Published var surfelExtent: Double {
         didSet { defaults.set(surfelExtent, forKey: Keys.surfelExtent) }
     }
-    /// Poisson / Density: voxel grid resolution along the longest axis.
+    /// Poisson / Density / Fusion: voxel grid resolution along the longest axis.
     @Published var poissonResolution: Double {
         didSet { defaults.set(poissonResolution, forKey: Keys.poissonResolution) }
+    }
+    /// Fusion: how many registered cameras to render and fuse. More = fuller
+    /// coverage and less noise, but proportionally slower. Views are sampled
+    /// evenly across the capture when the scene has more than this.
+    @Published var fusionMaxViews: Double {
+        didSet { defaults.set(fusionMaxViews, forKey: Keys.fusionMaxViews) }
     }
     /// Density: how tightly the iso-surface hugs the splats (0 = loose/inflated,
     /// 1 = tight to dense cores). Maps to the iso density level.
@@ -163,6 +192,22 @@ final class MeshSettings: ObservableObject {
     /// Density: shifts the surface outward (>0, inflate) or inward (<0).
     @Published var densityOffset: Double {
         didSet { defaults.set(densityOffset, forKey: Keys.densityOffset) }
+    }
+    /// Photogrammetry: detail level, 0 (fast/coarse) … 1 (full-resolution dense
+    /// stereo, slowest). Maps to OpenMVS DensifyPointCloud's resolution level.
+    @Published var photogrammetryQuality: Double {
+        didSet { defaults.set(photogrammetryQuality, forKey: Keys.photogrammetryQuality) }
+    }
+    /// Photogrammetry: run OpenMVS's RefineMesh stage for extra geometric detail
+    /// (noticeably slower).
+    @Published var photogrammetryRefine: Bool {
+        didSet { defaults.set(photogrammetryRefine, forKey: Keys.photogrammetryRefine) }
+    }
+
+    /// OpenMVS DensifyPointCloud `--resolution-level` from the quality slider:
+    /// higher quality → lower level (0 = full image resolution).
+    var photogrammetryResolutionLevel: Int {
+        photogrammetryQuality > 0.66 ? 0 : (photogrammetryQuality > 0.33 ? 1 : 2)
     }
 
     /// The current multi-image reconstruction knobs as one value.
@@ -182,7 +227,8 @@ final class MeshSettings: ObservableObject {
     /// key the in-app mesh preview cache so it rebuilds when the user tweaks it.
     func signature(forScene isScene: Bool) -> String {
         "\(method(forScene: isScene).rawValue)|\(smoothGrid)|\(depthRatioCull)|\(surfelExtent)"
-            + "|\(poissonResolution)|\(surfaceTightness)|\(densityOffset)"
+            + "|\(poissonResolution)|\(surfaceTightness)|\(densityOffset)|\(fusionMaxViews)"
+            + "|\(photogrammetryQuality)|\(photogrammetryRefine)"
     }
 
     private let defaults = UserDefaults.standard
@@ -201,6 +247,9 @@ final class MeshSettings: ObservableObject {
         static let poissonResolution = "mesh.poissonResolution"
         static let surfaceTightness = "mesh.surfaceTightness"
         static let densityOffset = "mesh.densityOffset"
+        static let fusionMaxViews = "mesh.fusionMaxViews"
+        static let photogrammetryQuality = "mesh.photogrammetryQuality"
+        static let photogrammetryRefine = "mesh.photogrammetryRefine"
     }
 
     init() {
@@ -209,15 +258,21 @@ final class MeshSettings: ObservableObject {
             ?? .timeAndLocation
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
         sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { $0 >= 3 ? 3 : 0 } ?? 0
-        useGlobalPoseSolver = defaults.object(forKey: Keys.useGlobalPoseSolver) as? Bool ?? false
+        // Default on: the global SfM solver registers cameras far more reliably than
+        // the incremental mapper, whose skewed subset throws off the gravity estimate
+        // and tilts the horizon. Falls back to the incremental mapper on older COLMAP.
+        useGlobalPoseSolver = defaults.object(forKey: Keys.useGlobalPoseSolver) as? Bool ?? true
         sceneTrainer = SplatTrainer(rawValue: defaults.string(forKey: Keys.sceneTrainer) ?? "") ?? .openSplat
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid
-        sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .density
+        sceneMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.sceneMethod) ?? "") ?? .photogrammetry
         smoothGrid = defaults.object(forKey: Keys.smoothGrid) as? Bool ?? false
         depthRatioCull = defaults.object(forKey: Keys.depthRatioCull) as? Double ?? 1.5
         surfelExtent = defaults.object(forKey: Keys.surfelExtent) as? Double ?? 2.0
         poissonResolution = defaults.object(forKey: Keys.poissonResolution) as? Double ?? 384
         surfaceTightness = defaults.object(forKey: Keys.surfaceTightness) as? Double ?? 0.5
         densityOffset = defaults.object(forKey: Keys.densityOffset) as? Double ?? 0.0
+        fusionMaxViews = defaults.object(forKey: Keys.fusionMaxViews) as? Double ?? 40
+        photogrammetryQuality = defaults.object(forKey: Keys.photogrammetryQuality) as? Double ?? 0.5
+        photogrammetryRefine = defaults.object(forKey: Keys.photogrammetryRefine) as? Bool ?? false
     }
 }

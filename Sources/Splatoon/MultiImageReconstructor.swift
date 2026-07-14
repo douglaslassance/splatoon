@@ -666,6 +666,15 @@ final class MultiImageReconstructor {
         plyURL.deletingPathExtension().appendingPathExtension("cameras.json")
     }
 
+    /// The persisted photogrammetry mesh-source bundle for `plyURL`: a directory
+    /// holding the prepared `images/` and the COLMAP `sparse/0` model, kept after
+    /// reconstruction so the OpenMVS pipeline can build a textured mesh on demand
+    /// (the scratch workDir it came from is deleted). Scoped exactly like
+    /// `camerasURL(for:)`.
+    static func meshSourceURL(for plyURL: URL) -> URL {
+        plyURL.deletingPathExtension().appendingPathExtension("meshsrc")
+    }
+
     // MARK: - Gravity alignment
 
     /// One camera as stored in OpenSplat's cameras.json (all fields preserved so

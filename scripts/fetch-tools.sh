@@ -5,6 +5,8 @@
 #
 #   - COLMAP    - camera pose solve (sparse reconstruction)  [Homebrew]
 #   - OpenSplat - Gaussian-splat trainer, Apple Metal (MPS)  [built from source]
+#   - Brush     - optional native-Metal splat trainer         [cargo]
+#   - OpenMVS   - dense MVS for the photogrammetry textured mesh [built from source]
 #
 # COLMAP installs into Homebrew's bin; OpenSplat's binary is copied to
 # /usr/local/bin. Both directories are on Splatoon's tool search path (see
@@ -99,8 +101,53 @@ echo "==> Installing opensplat -> $DEST/opensplat"
 mkdir -p "$DEST"
 cp opensplat "$DEST/opensplat"
 
+# --- OpenMVS (optional, photogrammetry textured mesh) ------------------------
+# The "Photogrammetry" mesh method runs COLMAP + OpenMVS on a scene's images to
+# build a watertight, UV-textured mesh. Built from source (no Homebrew formula),
+# CPU-only (no CUDA on Apple Silicon). Pinned to v2.3.0, which needs only the
+# classic deps (Eigen/OpenCV/CGAL/Boost/VCGLib) — later versions pull in a heavy
+# vcpkg-only SfM stack we don't use (COLMAP already solves poses).
+#
+# Notes on the flags below, learned building against current Homebrew:
+#   - boost@1.85: Boost 1.90 made boost_system header-only, which OpenMVS's CMake
+#     rejects; the 1.85 keg still ships the component configs it wants.
+#   - CMAKE_CXX_STANDARD=17: v2.3.0 uses std::shared_ptr::unique(), removed in C++20.
+#   - explicit OpenMP flags: libomp isn't auto-detected with AppleClang.
+#   - viewer/python/breakpad off: GUI + bindings we don't need, and extra deps.
+# If your Homebrew Eigen is 5.x (very new), v2.3.0's `FIND_PACKAGE(Eigen3 3.4)`
+# will reject it — install an Eigen 3.4 or relax that line; standard `brew install
+# eigen` (3.4) works out of the box.
+echo "==> Building OpenMVS (photogrammetry mesh; optional)"
+for pkg in eigen cgal glew nanoflann libomp boost@1.85; do
+  brew list "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+done
+B185="$(brew --prefix boost@1.85)"
+LIBOMP="$(brew --prefix libomp)"
+OMVS_WORK="${TMPDIR:-/tmp}/splatoon-openmvs"
+rm -rf "$OMVS_WORK"; mkdir -p "$OMVS_WORK"; cd "$OMVS_WORK"
+git clone --depth 1 https://github.com/cdcseacave/VCG.git vcglib
+git clone --depth 1 --branch v2.3.0 https://github.com/cdcseacave/openMVS.git openMVS
+mkdir -p openMVS_build && cd openMVS_build
+cmake ../openMVS -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+  -DOpenMVS_USE_CUDA=OFF -DOpenMVS_USE_PYTHON=OFF \
+  -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_BUILD_VIEWER=OFF \
+  -DVCG_ROOT="$OMVS_WORK/vcglib" \
+  -DBOOST_ROOT="$B185" -DBoost_DIR="$B185/lib/cmake/Boost-1.85.0" \
+  -DOpenMP_C_FLAGS="-Xclang -fopenmp -I$LIBOMP/include" \
+  -DOpenMP_CXX_FLAGS="-Xclang -fopenmp -I$LIBOMP/include" \
+  -DOpenMP_C_LIB_NAMES=omp -DOpenMP_CXX_LIB_NAMES=omp \
+  -DOpenMP_omp_LIBRARY="$LIBOMP/lib/libomp.dylib" \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix opencv);$(brew --prefix cgal);$(brew --prefix eigen);$(brew --prefix nanoflann);$B185"
+cmake --build . --config Release -j"$(sysctl -n hw.ncpu)"
+# Install the tools Splatoon shells out to (DensifyPointCloud is the dense-MVS core).
+for bin in InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureMesh; do
+  found="$(find "$OMVS_WORK/openMVS_build" -maxdepth 3 -type f -name "$bin" | head -1)"
+  if [ -n "$found" ]; then echo "==> Installing $bin -> $DEST/$bin"; cp "$found" "$DEST/$bin"; fi
+done
+
 echo ""
 echo "Done."
 echo "  COLMAP:    $(command -v colmap)"
 echo "  OpenSplat: $DEST/opensplat"
+echo "  OpenMVS:   $DEST/DensifyPointCloud (+ ReconstructMesh, TextureMesh, …)"
 echo "Open a photo that has several same-place/time siblings to reconstruct a scene."

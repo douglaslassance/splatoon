@@ -47,6 +47,14 @@ enum MeshExporter {
                      indices: mesh.indices.isEmpty ? nil : mesh.indices, to: outputURL)
     }
 
+    /// Write an already-built `Mesh` as binary glTF (.glb). Used by callers that
+    /// produce the mesh elsewhere (e.g. `DepthFusionMesher`) rather than from a
+    /// frozen Gaussian cloud.
+    static func saveGLB(mesh: Mesh, to outputURL: URL) throws {
+        try writeGLB(positions: mesh.positions, normals: mesh.normals, colors: mesh.colors,
+                     indices: mesh.indices.isEmpty ? nil : mesh.indices, to: outputURL)
+    }
+
     /// Build a triangle mesh from Gaussians using the chosen strategy. Shared by
     /// the .glb writer and the in-app SceneKit viewer so both show the same surface.
     static func buildMesh(gaussians: Gaussians3D,
@@ -157,7 +165,11 @@ enum MeshExporter {
                                  colors: &colors, indices: &indices)
             }
 
-        case .density:
+        case .density, .fusion, .photogrammetry:
+            // Fusion (DepthFusionMesher) and photogrammetry (PhotogrammetryMesher)
+            // are produced elsewhere — they need the scene cameras/images, not a
+            // frozen cloud. Should either route here, fall back to the normal-free
+            // density mesher.
             buildDensitySurface(n: n, resolution: poissonResolution,
                                 tightness: surfaceTightness, offset: densityOffset,
                                 position: position, axisVectors: axisVectors, scales: scales,
@@ -321,7 +333,9 @@ enum MeshExporter {
     }
 
     /// One narrow-band voxel: running weighted-average signed distance and colour.
-    private struct BandVoxel {
+    /// Internal (not private) so `DepthFusionMesher` can fill a band from fused
+    /// multi-view depth and hand it to `extractZeroSurface`.
+    struct BandVoxel {
         var tsdf: Float = 0
         var weight: Float = 0
         var color = SIMD3<Float>(repeating: 0)
@@ -578,7 +592,9 @@ enum MeshExporter {
     /// so the surface hugs the data without hallucinating unobserved regions.
     /// `outward` follows increasing field value, so a field that is negative inside
     /// the surface and positive outside yields outward-facing normals.
-    private static func extractZeroSurface(
+    /// Internal (not private) so `DepthFusionMesher` can reuse it on a band it
+    /// builds from fused multi-view depth.
+    static func extractZeroSurface(
         band: [Int64: BandVoxel], voxel: Float, origin: SIMD3<Float>,
         positions: inout [SIMD3<Float>], normals: inout [SIMD3<Float>],
         colors: inout [SIMD4<UInt8>], indices: inout [UInt32]

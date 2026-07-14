@@ -13,26 +13,52 @@ enum ReconstructionTool: String, CaseIterable {
     /// Optional native-Metal trainer, selected by the "Trainer" setting. Not in
     /// `required`, so its absence doesn't gate the multi-image feature.
     case brush
+    // OpenMVS binaries for the photogrammetry mesh pipeline (opt-in; each ships as
+    // its own executable). Not in `required` — their absence only disables the
+    // photogrammetry mesh method, not scene reconstruction.
+    case interfaceCOLMAP
+    case densifyPointCloud
+    case reconstructMesh
+    case refineMesh
+    case textureMesh
 
     /// The tools the pipeline always needs (COLMAP + the default trainer). Brush
-    /// is opt-in, so it's excluded.
+    /// and the OpenMVS tools are opt-in, so they're excluded.
     static let required: [ReconstructionTool] = [.colmap, .opensplat]
+
+    /// The OpenMVS executables the photogrammetry pipeline *requires* (COLMAP
+    /// supplies `image_undistorter` separately). `refineMesh` is excluded: it's an
+    /// optional stage, only invoked when the user enables Refine, so its absence
+    /// must not disable the whole feature.
+    static let openMVS: [ReconstructionTool] =
+        [.interfaceCOLMAP, .densifyPointCloud, .reconstructMesh, .textureMesh]
 
     var displayName: String {
         switch self {
-        case .colmap:    return "COLMAP"
-        case .opensplat: return "OpenSplat"
-        case .brush:     return "Brush"
+        case .colmap:            return "COLMAP"
+        case .opensplat:         return "OpenSplat"
+        case .brush:             return "Brush"
+        case .interfaceCOLMAP:   return "OpenMVS InterfaceCOLMAP"
+        case .densifyPointCloud: return "OpenMVS DensifyPointCloud"
+        case .reconstructMesh:   return "OpenMVS ReconstructMesh"
+        case .refineMesh:        return "OpenMVS RefineMesh"
+        case .textureMesh:       return "OpenMVS TextureMesh"
         }
     }
 
     /// The executable's filename on disk (differs from the case name for Brush,
-    /// whose headless binary is `brush-cli`).
+    /// whose headless binary is `brush-cli`; the OpenMVS tools keep their
+    /// CamelCase executable names).
     var binaryName: String {
         switch self {
-        case .colmap:    return "colmap"
-        case .opensplat: return "opensplat"
-        case .brush:     return "brush-cli"
+        case .colmap:            return "colmap"
+        case .opensplat:         return "opensplat"
+        case .brush:             return "brush-cli"
+        case .interfaceCOLMAP:   return "InterfaceCOLMAP"
+        case .densifyPointCloud: return "DensifyPointCloud"
+        case .reconstructMesh:   return "ReconstructMesh"
+        case .refineMesh:        return "RefineMesh"
+        case .textureMesh:       return "TextureMesh"
         }
     }
 
@@ -44,6 +70,8 @@ enum ReconstructionTool: String, CaseIterable {
         case .colmap:    return "Install with `brew install colmap`, or run scripts/fetch-tools.sh."
         case .opensplat: return "Build/download OpenSplat via scripts/fetch-tools.sh."
         case .brush:     return "Install with `cargo install --git https://github.com/ArthurBrussee/brush brush-cli`, or run scripts/fetch-tools.sh."
+        case .interfaceCOLMAP, .densifyPointCloud, .reconstructMesh, .refineMesh, .textureMesh:
+            return "Build OpenMVS via scripts/fetch-tools.sh (for the photogrammetry mesh)."
         }
     }
 }
@@ -84,6 +112,13 @@ enum ToolLocator {
 
     static var isAvailable: Bool {
         ReconstructionTool.required.allSatisfy { resolvedURL(for: $0) != nil }
+    }
+
+    /// Whether the OpenMVS photogrammetry pipeline can run: COLMAP (for
+    /// `image_undistorter`) plus every OpenMVS binary must resolve.
+    static var photogrammetryAvailable: Bool {
+        resolvedURL(for: .colmap) != nil
+            && ReconstructionTool.openMVS.allSatisfy { resolvedURL(for: $0) != nil }
     }
 
     /// Resolve, prompting the user to locate the binary if it isn't found. Must

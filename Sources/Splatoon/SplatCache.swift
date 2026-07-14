@@ -15,16 +15,20 @@ enum SplatCache {
             .appendingPathComponent("Splatoon/Splats", isDirectory: true)
     }
 
-    /// Total bytes of every file in the cache directory.
+    /// Total bytes of every file in the cache directory, recursing into subdirs
+    /// (splats sit at the top level, but a scene's `.meshsrc` / `.mesh` bundles are
+    /// directories of images/model files).
     static func size() -> Int64 {
         let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(at: directory,
-                                                      includingPropertiesForKeys: [.fileSizeKey]) else {
+        guard let e = fm.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else {
             return 0
         }
-        return items.reduce(0) { sum, url in
-            sum + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        var total: Int64 = 0
+        for case let url as URL in e {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values?.isRegularFile == true { total += Int64(values?.fileSize ?? 0) }
         }
+        return total
     }
 
     /// Delete every cached file (leaving the directory), then broadcast so the

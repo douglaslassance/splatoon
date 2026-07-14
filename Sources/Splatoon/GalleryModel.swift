@@ -67,7 +67,14 @@ final class GalleryModel: ObservableObject {
     /// detail view switches to Mesh mode. `openedMeshKey` identifies which
     /// (splat, mesh-settings) combination it was built for.
     @Published private(set) var openedMesh: Mesh?
+    /// The photogrammetry (OpenMVS) textured-mesh OBJ for the opened splat, when
+    /// the Photogrammetry method is selected. Mutually exclusive with `openedMesh`
+    /// (that path produces an in-memory vertex-coloured `Mesh`; this one a
+    /// URL-backed textured OBJ the viewer/export load directly).
+    @Published private(set) var openedTexturedMeshURL: URL?
     private var openedMeshKey: String?
+    /// The running photogrammetry mesher, so a new request / close can cancel it.
+    private var photogrammetryMesher: PhotogrammetryMesher?
 
     /// Fraction of Gaussians to keep (1.0 = all).
     var decimation: Float = 1.0
@@ -368,6 +375,7 @@ final class GalleryModel: ObservableObject {
     /// Cancel button). Unlike navigating away, this really does discard it.
     func cancelSceneReconstruction() {
         sceneReconstructor?.cancel()
+        photogrammetryMesher?.cancel()
     }
 
     /// Bring the scene tracked by `sceneProgress` back on screen — either its
@@ -561,6 +569,11 @@ final class GalleryModel: ObservableObject {
                     self.sceneProgress = SceneProgress(key: key, title: title, stageLabel: "Ready",
                                                        fraction: 1, isComplete: true, elapsed: elapsed)
                 }
+                // Persist the photogrammetry mesh-source (prepared images + COLMAP
+                // model) beside the splat before the scratch workDir is wiped, so
+                // the OpenMVS mesh can be built on demand later. Best-effort.
+                Self.persistMeshSource(imagesDir: imagesDir, sparseZero: workDir.appendingPathComponent("sparse/0"),
+                                       to: MultiImageReconstructor.meshSourceURL(for: destination))
                 try? fm.removeItem(at: workDir)
             } catch {
                 await MainActor.run {
@@ -769,7 +782,10 @@ final class GalleryModel: ObservableObject {
     }
 
     private func resetOpenedMesh() {
+        photogrammetryMesher?.cancel()
+        photogrammetryMesher = nil
         openedMesh = nil
+        openedTexturedMeshURL = nil
         openedMeshKey = nil
     }
 
@@ -785,29 +801,55 @@ final class GalleryModel: ObservableObject {
                          surfelExtent: Float,
                          poissonResolution: Int,
                          surfaceTightness: Float,
-                         densityOffset: Float) {
+                         densityOffset: Float,
+                         fusionMaxViews: Int,
+                         photogrammetryResolutionLevel: Int,
+                         photogrammetryRefine: Bool) {
         guard let opened, let source = opened.url else { return }
         let key = "\(opened.id)|\(settingsSignature)"
-        if openedMeshKey == key, openedMesh != nil { return }   // already current
+        // Already built for this (splat, settings), or a photogrammetry build for it
+        // is still running — don't rebuild/restart (e.g. on a Splat↔Mesh toggle).
+        if openedMeshKey == key,
+           openedMesh != nil || openedTexturedMeshURL != nil || photogrammetryMesher != nil { return }
 
-        // The grid method needs SHARP's structured image grid; unstructured scene
-        // splats have none, so mesh them volumetrically instead.
-        let method = Self.effectiveMethod(method, isScene: opened.isScene)
+        // Resolve the method for this splat (grid -> poisson for scenes, fusion ->
+        // density when the scene has no registered cameras).
+        let method = Self.effectiveMethod(method, isScene: opened.isScene, source: source)
 
         openedMesh = nil
+        openedTexturedMeshURL = nil
+        photogrammetryMesher?.cancel()
+        photogrammetryMesher = nil
         openedMeshKey = key
         let meshStart = Date()
         let meshTitle = opened.title
         let meshIsScene = opened.isScene
         let meshOwnerID = opened.id
+
+        // Photogrammetry (OpenMVS) is a slow, staged, URL-backed pipeline — handle
+        // it separately from the instant in-memory meshers.
+        if method == .photogrammetry {
+            buildPhotogrammetryMesh(key: key, source: source, title: meshTitle, isScene: meshIsScene,
+                                    ownerID: meshOwnerID, meshStart: meshStart,
+                                    resolutionLevel: photogrammetryResolutionLevel, refine: photogrammetryRefine)
+            return
+        }
+
         setIndeterminate("Building mesh…")
         Task.detached(priority: .userInitiated) {
             do {
-                let gaussians = try SplatPLYReader.readGaussians(from: source)
-                let mesh = MeshExporter.buildMesh(gaussians: gaussians, method: method,
+                let mesh: Mesh
+                if method == .fusion {
+                    mesh = try await DepthFusionMesher.buildMesh(
+                        plyURL: source, camerasURL: MultiImageReconstructor.camerasURL(for: source),
+                        resolution: poissonResolution, maxViews: fusionMaxViews)
+                } else {
+                    let gaussians = try SplatPLYReader.readGaussians(from: source)
+                    mesh = MeshExporter.buildMesh(gaussians: gaussians, method: method,
                                                   smoothGrid: smoothGrid, depthRatioCull: depthRatioCull,
                                                   surfelExtent: surfelExtent, poissonResolution: poissonResolution,
                                                   surfaceTightness: surfaceTightness, densityOffset: densityOffset)
+                }
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }  // superseded meanwhile
                     self.openedMesh = mesh
@@ -821,6 +863,76 @@ final class GalleryModel: ObservableObject {
                 await MainActor.run {
                     guard self.openedMeshKey == key else { return }
                     self.clearIndeterminate()
+                    self.errorMessage = "Mesh build failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// Build (or reuse) the photogrammetry (OpenMVS) textured mesh for the opened
+    /// splat. Reuses the cached `.mesh` bundle when present; otherwise runs the
+    /// pipeline with staged, cancellable progress in the docked bar. Requires
+    /// OpenMVS and the scene's saved mesh source (older scenes must be regenerated).
+    private func buildPhotogrammetryMesh(key: String, source: URL, title: String, isScene: Bool,
+                                         ownerID: String, meshStart: Date,
+                                         resolutionLevel: Int, refine: Bool) {
+        // Reuse a previously built bundle for these exact settings instantly.
+        let objURL = PhotogrammetryMesher.meshOBJURL(for: source, resolutionLevel: resolutionLevel, refine: refine)
+        if FileManager.default.fileExists(atPath: objURL.path) {
+            openedTexturedMeshURL = objURL
+            sceneProgress = SceneProgress(key: ownerID, title: title, stageLabel: "Mesh ready",
+                                          fraction: 1, isComplete: true, isScene: isScene, cancellable: false)
+            return
+        }
+        guard ToolLocator.photogrammetryAvailable, let mesher = PhotogrammetryMesher() else {
+            openedMeshKey = nil
+            errorMessage = "Photogrammetry needs OpenMVS. Run scripts/fetch-tools.sh, then try again."
+            return
+        }
+        let meshSource = MultiImageReconstructor.meshSourceURL(for: source)
+        guard FileManager.default.fileExists(atPath: meshSource.appendingPathComponent("sparse/0").path) else {
+            openedMeshKey = nil
+            errorMessage = "This scene has no saved photogrammetry source. Regenerate it to build a "
+                + "photogrammetry mesh (scenes made before this feature don't keep their images)."
+            return
+        }
+
+        mesher.resolutionLevel = resolutionLevel
+        mesher.refineMesh = refine
+        photogrammetryMesher = mesher
+        sceneProgress = SceneProgress(key: ownerID, title: title, stageLabel: "Preparing mesh…",
+                                      fraction: 0, isScene: isScene, cancellable: true)
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Splatoon/mesh-\(key.hashValue)", isDirectory: true)
+        let bundle = PhotogrammetryMesher.meshBundleURL(for: source, resolutionLevel: resolutionLevel, refine: refine)
+        Task.detached(priority: .userInitiated) {
+            do {
+                let obj = try mesher.run(meshSource: meshSource, workDir: workDir, bundle: bundle) { update in
+                    Task { @MainActor in
+                        guard self.openedMeshKey == key, self.sceneProgress?.key == ownerID else { return }
+                        self.sceneProgress?.stageLabel = update.stageLabel
+                        self.sceneProgress?.fraction = update.fraction
+                    }
+                }
+                await MainActor.run {
+                    // Only clear the shared mesher if THIS build is still current —
+                    // a newer build may already have replaced it (and must stay
+                    // cancellable). Same for the catch block below.
+                    guard self.openedMeshKey == key else { return }   // superseded meanwhile
+                    self.photogrammetryMesher = nil
+                    self.openedTexturedMeshURL = obj
+                    self.sceneProgress = SceneProgress(key: ownerID, title: title, stageLabel: "Mesh ready",
+                                                       fraction: 1, isComplete: true, isScene: isScene,
+                                                       cancellable: false, elapsed: Self.elapsedString(since: meshStart))
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.openedMeshKey == key else { return }
+                    self.photogrammetryMesher = nil
+                    self.clearIndeterminate()
+                    self.sceneProgress = nil
+                    self.openedMeshKey = nil
+                    if case PhotogrammetryMesher.MeshError.cancelled = error { return }   // user cancelled
                     self.errorMessage = "Mesh build failed: \(error.localizedDescription)"
                 }
             }
@@ -894,6 +1006,37 @@ final class GalleryModel: ObservableObject {
         }
     }
 
+    /// Export the photogrammetry textured mesh: copy the whole `.mesh` bundle
+    /// (model.obj + .mtl + texture images, so the material references stay valid)
+    /// into a user-chosen folder.
+    func exportTexturedMesh() {
+        guard let opened, let objURL = openedTexturedMeshURL else {
+            errorMessage = "No photogrammetry mesh to export yet."
+            return
+        }
+        let bundle = objURL.deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: objURL.path) else {
+            errorMessage = "No photogrammetry mesh to export yet."
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Export Textured Mesh"
+        panel.message = "Choose a folder to export the textured mesh (OBJ + textures) into."
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        let dest = dir.appendingPathComponent((opened.title as NSString).deletingPathExtension + "-mesh")
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
+            try FileManager.default.copyItem(at: bundle, to: dest)
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
+        } catch {
+            errorMessage = "Mesh export failed: \(error.localizedDescription)"
+        }
+    }
+
     /// Export a triangle mesh (.glb), built on demand from the cached splat PLY so
     /// it always reflects the current meshing code (no re-inference needed).
     func exportMesh(method: MeshMethod,
@@ -902,7 +1045,8 @@ final class GalleryModel: ObservableObject {
                     surfelExtent: Float,
                     poissonResolution: Int,
                     surfaceTightness: Float,
-                    densityOffset: Float) {
+                    densityOffset: Float,
+                    fusionMaxViews: Int) {
         guard let opened, let source = opened.url else { return }
         let panel = NSSavePanel()
         panel.title = "Export Mesh"
@@ -910,16 +1054,22 @@ final class GalleryModel: ObservableObject {
         panel.allowedContentTypes = [UTType(filenameExtension: "glb") ?? .data]
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
-        let method = Self.effectiveMethod(method, isScene: opened.isScene)
+        let method = Self.effectiveMethod(method, isScene: opened.isScene, source: source)
         setIndeterminate("Exporting mesh…")
         Task.detached(priority: .userInitiated) {
             do {
-                let gaussians = try SplatPLYReader.readGaussians(from: source)
-                try MeshExporter.saveGLB(gaussians: gaussians, to: destination,
-                                         method: method, smoothGrid: smoothGrid,
-                                         depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
-                                         poissonResolution: poissonResolution,
-                                         surfaceTightness: surfaceTightness, densityOffset: densityOffset)
+                if method == .fusion {
+                    try await DepthFusionMesher.saveGLB(
+                        plyURL: source, camerasURL: MultiImageReconstructor.camerasURL(for: source),
+                        to: destination, resolution: poissonResolution, maxViews: fusionMaxViews)
+                } else {
+                    let gaussians = try SplatPLYReader.readGaussians(from: source)
+                    try MeshExporter.saveGLB(gaussians: gaussians, to: destination,
+                                             method: method, smoothGrid: smoothGrid,
+                                             depthRatioCull: depthRatioCull, surfelExtent: surfelExtent,
+                                             poissonResolution: poissonResolution,
+                                             surfaceTightness: surfaceTightness, densityOffset: densityOffset)
+                }
                 await MainActor.run { self.clearIndeterminate() }
             } catch {
                 await MainActor.run {
@@ -932,10 +1082,36 @@ final class GalleryModel: ObservableObject {
 
     // MARK: - Helpers
 
-    /// The grid method assumes SHARP's structured image grid. Scene splats are
-    /// unstructured, so fall back to volumetric (poisson) meshing for them.
-    private static func effectiveMethod(_ method: MeshMethod, isScene: Bool) -> MeshMethod {
-        (isScene && method == .grid) ? .poisson : method
+    /// Copy the prepared images + COLMAP `sparse/0` model into `dest` (the splat's
+    /// `.meshsrc` bundle) so OpenMVS can build a textured mesh on demand after the
+    /// scratch workDir is deleted. Replaces any stale bundle. Best-effort: a
+    /// failure just means photogrammetry will report the source is missing.
+    private nonisolated static func persistMeshSource(imagesDir: URL, sparseZero: URL, to dest: URL) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: imagesDir.path), fm.fileExists(atPath: sparseZero.path) else { return }
+        try? fm.removeItem(at: dest)
+        do {
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            try fm.copyItem(at: imagesDir, to: dest.appendingPathComponent("images"))
+            let sparseDest = dest.appendingPathComponent("sparse/0")
+            try fm.createDirectory(at: sparseDest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.copyItem(at: sparseZero, to: sparseDest)
+        } catch {
+            try? fm.removeItem(at: dest)   // don't leave a half-written bundle
+        }
+    }
+
+    /// Resolve the meshing method for a specific splat. The grid method assumes
+    /// SHARP's structured image grid, so scene splats fall back to volumetric
+    /// (poisson). Multi-view fusion needs the scene's registered cameras, so it
+    /// falls back to density when cameras.json is missing or too sparse (e.g. a
+    /// single-image SHARP splat, or an imported PLY without poses).
+    private static func effectiveMethod(_ method: MeshMethod, isScene: Bool, source: URL) -> MeshMethod {
+        if method == .fusion {
+            let cameras = MultiImageReconstructor.camerasURL(for: source)
+            return DepthFusionMesher.cameraCount(at: cameras) >= 3 ? .fusion : .density
+        }
+        return (isScene && method == .grid) ? .poisson : method
     }
 
     private static func title(for asset: PHAsset) -> String {
