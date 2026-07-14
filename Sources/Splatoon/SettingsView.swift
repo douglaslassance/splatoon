@@ -48,6 +48,7 @@ struct SettingsView: View {
                          + "reconstruct a multi-view splat (COLMAP + OpenSplat) instead of a single-image one. "
                          + "Blurry and badly-exposed frames are dropped automatically.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -62,6 +63,7 @@ struct SettingsView: View {
                          + "“Location only” groups everything shot at that place, even on different days "
                          + "(needs location data on the photos).")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
@@ -86,6 +88,7 @@ struct SettingsView: View {
                     Text("OpenSplat is the reliable default. Brush is a native-Metal trainer (no libtorch), "
                          + "usually much faster on Apple GPUs. If Brush isn't installed, OpenSplat is used instead.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
@@ -100,6 +103,7 @@ struct SettingsView: View {
                          + "for most captures. Full adds view-dependent shine at several times the file "
                          + "size and slower rendering.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
@@ -111,6 +115,7 @@ struct SettingsView: View {
                          + "incremental solver often aligns only a fraction of the shots. Falls back "
                          + "automatically on older COLMAP builds.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
