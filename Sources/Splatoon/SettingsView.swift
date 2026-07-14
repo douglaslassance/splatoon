@@ -11,6 +11,8 @@ struct SettingsView: View {
                 .tabItem { Label("Single Image", systemImage: "photo") }
             multiImageTab
                 .tabItem { Label("Multi-Input", systemImage: "square.stack.3d.up") }
+            CacheTab()
+                .tabItem { Label("Cache", systemImage: "internaldrive") }
         }
         .frame(width: 480)
         .padding(20)
@@ -67,8 +69,8 @@ struct SettingsView: View {
                 sliderRow(title: "Training steps",
                           valueText: "\(Int(settings.multiImageIterations)) (~\(estimatedMinutes) min)",
                           value: $settings.multiImageIterations, range: 1000...30000, step: 500,
-                          caption: "How long the multi-view trainer runs. Too few and the splat stays blurry; "
-                              + "quality keeps improving well past 15000. Higher is sharper but slower. "
+                          caption: "How long the multi-view trainer runs. Too few and the splat stays blurry. "
+                              + "Quality keeps improving well past 15000. Higher is sharper but slower. "
                               + "Time is a rough estimate (~13 steps/sec) — actual speed depends on your Mac.")
                     .disabled(!settings.useMultiImageReconstruction)
                     .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
@@ -155,7 +157,7 @@ struct SettingsView: View {
                     sliderRow(title: "Surface tightness",
                               valueText: String(format: "%.2f", settings.surfaceTightness),
                               value: $settings.surfaceTightness, range: 0...1,
-                              caption: "How tightly the surface hugs the splats. Higher pulls it toward the densest cores (thinner, more detail but more holes); lower gives a fuller, smoother shell.")
+                              caption: "How tightly the surface hugs the splats. Higher pulls it toward the densest cores (thinner, more detail but more holes). Lower gives a fuller, smoother shell.")
                     sliderRow(title: "Offset",
                               valueText: String(format: "%+.2f", settings.densityOffset),
                               value: $settings.densityOffset, range: -1...1,
@@ -232,5 +234,67 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The Cache tab: shows how much disk the generated splats occupy, and empties
+/// it on demand. Sizing runs off the main thread so a large cache doesn't hitch
+/// the panel.
+private struct CacheTab: View {
+    @State private var sizeBytes: Int64 = 0
+    @State private var isWorking = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        Text("Cached splats")
+                        Spacer()
+                        Text(sizeText).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    Text("Generated splats (single-image and multi-input scenes), their camera "
+                         + "poses, and mesh previews are cached on disk so reopening is instant. "
+                         + "Clearing frees the space. Everything regenerates on demand.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Clear Cache", role: .destructive, action: clear)
+                            .disabled(sizeBytes == 0 || isWorking)
+                        if isWorking { ProgressView().controlSize(.small) }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            } label: {
+                Text("Storage").font(.headline)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear(perform: refresh)
+    }
+
+    private var sizeText: String {
+        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+
+    private func refresh() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let s = SplatCache.size()
+            DispatchQueue.main.async { sizeBytes = s }
+        }
+    }
+
+    private func clear() {
+        isWorking = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            SplatCache.clear()
+            let s = SplatCache.size()
+            DispatchQueue.main.async {
+                sizeBytes = s
+                isWorking = false
+            }
+        }
     }
 }

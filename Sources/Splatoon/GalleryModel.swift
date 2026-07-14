@@ -97,10 +97,13 @@ final class GalleryModel: ObservableObject {
     private var sceneReconstructor: MultiImageReconstructor?
 
     init() {
-        cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Splatoon/Splats", isDirectory: true)
+        cacheDir = SplatCache.directory
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         loadCacheIndex()
+        // Drop "has splat" badges as soon as the Settings Cache tab empties the cache.
+        NotificationCenter.default.addObserver(forName: .splatCacheCleared, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.loadCacheIndex() }
+        }
     }
 
     // MARK: - Authorization & fetch

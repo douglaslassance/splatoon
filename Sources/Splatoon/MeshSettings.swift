@@ -39,7 +39,7 @@ enum MeshMethod: String, CaseIterable, Identifiable {
             return "Emits one oriented quad per splat. Faithful to each splat's shape, but not a connected surface."
         case .poisson:
             return "Volumetric reconstruction (TSDF + marching tetrahedra) from the oriented point cloud. "
-                + "Smoother and hole-filled; an on-device stand-in for screened Poisson."
+                + "Smoother and hole-filled. An on-device stand-in for screened Poisson."
         }
     }
 }
