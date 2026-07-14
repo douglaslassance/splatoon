@@ -348,9 +348,17 @@ final class MultiImageReconstructor {
         // source is given). sh-degree is 0…4 (unlike OpenSplat it allows 0). Brush
         // always exports on the final step, so a large --export-every just avoids
         // redundant intermediate writes; we take the newest PLY afterward.
+        //
+        // Stop densification at the halfway point so the second half of training
+        // is a refinement/consolidation phase. Brush's default growth-stop (15000)
+        // equals our default iteration count, which would run densification for
+        // the entire training and skip refinement entirely — leaving a bloated,
+        // over-bright splat cloud that washes the viewer white on harder scenes.
+        let growthStop = max(1, trainingIterations / 2)
         let args = [
             workDir.path,
             "--total-train-iters", String(trainingIterations),
+            "--growth-stop-iter", String(growthStop),
             "--sh-degree", String(min(4, max(0, shDegree))),
             "--max-resolution", "1920",
             "--export-path", exportDir.path,
