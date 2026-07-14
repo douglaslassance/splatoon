@@ -113,15 +113,6 @@ struct SettingsView: View {
                 }
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
-
-                Label {
-                    Text("For best results use a **video** (or several), or many overlapping photos in a slow "
-                         + "continuous orbit. Spread-out angles won't align.")
-                        .font(.caption).foregroundStyle(.secondary)
-                } icon: {
-                    Image(systemName: "video").foregroundStyle(.secondary)
-                }
-                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(6)
