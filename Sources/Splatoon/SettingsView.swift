@@ -92,14 +92,13 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Colour detail", selection: $settings.sceneSHDegree) {
-                        Text("Standard").tag(1)
-                        Text("High").tag(2)
-                        Text("Maximum").tag(3)
+                        Text("Standard").tag(0)
+                        Text("Full").tag(3)
                     }
                     .pickerStyle(.segmented)
-                    Text("Spherical-harmonics degree. Higher captures more view-dependent shine but "
-                         + "multiplies the splat's colour data (Maximum files are several times larger and "
-                         + "slower to render). Standard is plenty for most captures.")
+                    Text("Standard stores one flat colour per splat, the most compact option and plenty "
+                         + "for most captures. Full adds view-dependent shine at several times the file "
+                         + "size and slower rendering.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(!settings.useMultiImageReconstruction)

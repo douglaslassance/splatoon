@@ -112,10 +112,10 @@ final class MeshSettings: ObservableObject {
     @Published var multiImageIterations: Double {
         didSet { defaults.set(multiImageIterations, forKey: Keys.multiImageIterations) }
     }
-    /// Spherical-harmonics degree the multi-view trainer uses (1…3). Defaults to
-    /// 1: casual captures gain little from higher-order view-dependent colour, and
-    /// each extra degree multiplies the per-splat colour storage (degree 3 splats
-    /// are several times larger on disk and slower to render).
+    /// Spherical-harmonics degree the multi-view trainer targets. Constrained to
+    /// what the viewer's PLY reader accepts: 0 (one flat colour per splat, the
+    /// compact default) or 3 (full view-dependent colour, several times larger).
+    /// Intermediate degrees are stripped to 0 after training so they still load.
     @Published var sceneSHDegree: Int {
         didSet { defaults.set(sceneSHDegree, forKey: Keys.sceneSHDegree) }
     }
@@ -208,7 +208,7 @@ final class MeshSettings: ObservableObject {
         sceneMatchMode = SceneGrouping.MatchMode(rawValue: defaults.string(forKey: Keys.sceneMatchMode) ?? "")
             ?? .timeAndLocation
         multiImageIterations = defaults.object(forKey: Keys.multiImageIterations) as? Double ?? 15000
-        sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { min(3, max(1, $0)) } ?? 1
+        sceneSHDegree = (defaults.object(forKey: Keys.sceneSHDegree) as? Int).map { $0 >= 3 ? 3 : 0 } ?? 0
         useGlobalPoseSolver = defaults.object(forKey: Keys.useGlobalPoseSolver) as? Bool ?? false
         sceneTrainer = SplatTrainer(rawValue: defaults.string(forKey: Keys.sceneTrainer) ?? "") ?? .openSplat
         singleImageMethod = MeshMethod(rawValue: defaults.string(forKey: Keys.singleImageMethod) ?? "") ?? .grid

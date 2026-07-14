@@ -275,6 +275,11 @@ final class MultiImageReconstructor {
 
         guard fm.fileExists(atPath: output.path) else { throw ReconstructionError.noOutput }
 
+        // The viewer's PLY reader only accepts a full (degree-3) or empty SH set;
+        // a partial one (degree 1/2) fails to load and the viewport stays blank.
+        // Strip partial sets to degree 0 so every splat we produce is loadable.
+        Self.normalizeSHForViewer(output)
+
         // COLMAP's world frame is arbitrary (built off its bootstrap image pair),
         // so scenes come out tilted — the horizon isn't level and the fly camera
         // feels off. Rotate the splat + camera poses so the estimated gravity-up
@@ -397,6 +402,73 @@ final class MultiImageReconstructor {
         // recovery + gravity alignment read, from the COLMAP model.
         writeCamerasJSON(fromColmapSparse: sparseZero, workDir: workDir,
                          to: Self.camerasURL(for: output))
+    }
+
+    /// MetalSplatter's PLY reader (the viewer's loader) hardcodes 45
+    /// spherical-harmonics rest coefficients: it accepts either none (degree 0)
+    /// or all 45 (degree 3), and throws on any partial set — so a degree-1 splat
+    /// (9 coefficients) or degree-2 (24) fails to load and the viewport stays
+    /// blank. Strip a partial set down to degree 0 (drop every `f_rest_*`
+    /// property) so our output is always loadable. Degree-0 and degree-3 PLYs are
+    /// left untouched. Best-effort: leaves the file alone if it can't be parsed.
+    private static func normalizeSHForViewer(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let headerRange = data.range(of: Data("end_header\n".utf8)),
+              let header = String(data: data.subdata(in: 0..<headerRange.upperBound), encoding: .ascii) else {
+            return
+        }
+        struct Prop { let name: String; let size: Int; let offset: Int }
+        var props: [Prop] = []
+        var format = "", count = 0, inVertex = false, offset = 0
+        for line in header.split(separator: "\n") {
+            let parts = line.split(separator: " ").map(String.init)
+            guard let keyword = parts.first else { continue }
+            switch keyword {
+            case "format" where parts.count >= 2:
+                format = parts[1]
+            case "element" where parts.count >= 3:
+                inVertex = (parts[1] == "vertex")
+                if inVertex { count = Int(parts[2]) ?? 0 }
+            case "property" where inVertex && parts.count >= 3 && parts[1] != "list":
+                let size = typeSize(parts[1])
+                props.append(Prop(name: parts[2], size: size, offset: offset))
+                offset += size
+            default:
+                break
+            }
+        }
+        let stride = offset
+        let restCount = props.filter { $0.name.hasPrefix("f_rest_") }.count
+        // Only touch partial sets — degree 0 (none) and degree 3 (45) already load.
+        guard format == "binary_little_endian", count > 0, stride > 0,
+              restCount != 0, restCount != 45 else { return }
+        let bodyStart = headerRange.upperBound
+        guard bodyStart + count * stride <= data.count else { return }
+
+        let keep = props.filter { !$0.name.hasPrefix("f_rest_") }
+        let newStride = keep.reduce(0) { $0 + $1.size }
+        var out = [UInt8](repeating: 0, count: count * newStride)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            out.withUnsafeMutableBytes { dst in
+                for i in 0..<count {
+                    var w = i * newStride
+                    let base = bodyStart + i * stride
+                    for p in keep {
+                        memcpy(dst.baseAddress!.advanced(by: w),
+                               raw.baseAddress!.advanced(by: base + p.offset), p.size)
+                        w += p.size
+                    }
+                }
+            }
+        }
+        // Rebuild the header without the f_rest_* property lines (preserving the
+        // trailing newline after end_header via the empty final split element).
+        let newHeader = header.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !($0.hasPrefix("property") && $0.contains(" f_rest_")) }
+            .joined(separator: "\n")
+        var result = Data(newHeader.utf8)
+        result.append(contentsOf: out)
+        try? result.write(to: url)
     }
 
     /// Drop pathologically large splats from a 3DGS PLY in place: any whose
