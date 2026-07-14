@@ -410,20 +410,13 @@ final class GalleryModel: ObservableObject {
         // COLMAP's O(n) sequential matcher (right for walk-throughs) instead of
         // exhaustive. Photo groups aren't ordered, so they stay exhaustive.
         let sequentialMatching = !sources.isEmpty && videoCount == sources.count
-        startSceneReconstruction(key: key, title: Self.sceneTitle(for: sources),
+        // Title the scene by the asset the user opened (its filename), matching
+        // the single-image convention, rather than a generic "Scene · N photos".
+        startSceneReconstruction(key: key, title: Self.title(for: hero),
                                  options: options, hero: hero, sharedCamera: sharedCamera,
                                  sequentialMatching: sequentialMatching) { imagesDir, report in
             await self.selectAndWriteFrames(from: sources, to: imagesDir, report: report)
         }
-    }
-
-    /// A human title for a scene built from `sources`.
-    private static func sceneTitle(for sources: [PHAsset]) -> String {
-        let videos = sources.filter { $0.mediaType == .video }.count
-        let photos = sources.count - videos
-        if videos == 0 { return "Scene · \(photos) photos" }
-        if photos == 0 { return videos == 1 ? "Video scene" : "Video scene · \(videos) clips" }
-        return "Scene · \(photos) photo\(photos == 1 ? "" : "s") + \(videos) video\(videos == 1 ? "" : "s")"
     }
 
     /// Recover from a failed scene by running single-image SHARP on the asset the
