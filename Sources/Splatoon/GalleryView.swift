@@ -20,6 +20,10 @@ struct GalleryView: View {
                                       matchMode: settings.sceneMatchMode)
                         }
                         .help("Double-click to open its 3D splat")
+                        .contextMenu {
+                            Button("Open in Finder") { model.revealInFinder(asset) }
+                            Button("Move to Trash", role: .destructive) { model.moveToTrash(asset) }
+                        }
                 }
             }
             .padding(2)

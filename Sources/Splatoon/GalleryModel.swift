@@ -137,6 +137,37 @@ final class GalleryModel: ObservableObject {
         assets = collected
     }
 
+    // MARK: - Gallery item actions
+
+    /// Reveal the asset's original file in Finder. Photos stores originals inside
+    /// its library package; the app isn't sandboxed, so Finder can select them.
+    func revealInFinder(_ asset: PHAsset) {
+        let options = PHContentEditingInputRequestOptions()
+        options.isNetworkAccessAllowed = true
+        asset.requestContentEditingInput(with: options) { input, _ in
+            let url = input?.fullSizeImageURL ?? (input?.audiovisualAsset as? AVURLAsset)?.url
+            guard let url else { return }
+            Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        }
+    }
+
+    /// Move the asset to Trash. For a Photos asset that means deleting it from the
+    /// library (into Photos' Recently Deleted); the system shows its own
+    /// confirmation. On success, drop it from the grid.
+    func moveToTrash(_ asset: PHAsset) {
+        PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets([asset] as NSArray)
+        } completionHandler: { success, error in
+            Task { @MainActor in
+                if success {
+                    self.assets.removeAll { $0.localIdentifier == asset.localIdentifier }
+                } else if let error {
+                    self.errorMessage = "Couldn't move to Trash: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     // MARK: - Cache
 
     func hasSplat(_ asset: PHAsset) -> Bool {
