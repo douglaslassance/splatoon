@@ -30,52 +30,20 @@ struct SettingsView: View {
     }
 
     /// Chooses how a single photo becomes a splat: SHARP (fast relief) or
-    /// TripoSplat (full 3D object). The TripoSplat row is greyed out when the
-    /// `tripo-cli` tool isn't installed.
+    /// TripoSplat (full 3D object). The TripoSplat row greys out when `tripo-cli`
+    /// isn't installed — the same treatment as an unavailable mesh method.
     private var generatorCard: some View {
-        let triposplatAvailable = ToolLocator.tripoSplatAvailable
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(SingleImageGenerator.allCases) { gen in
-                    let disabled = (gen == .triposplat && !triposplatAvailable)
-                    Button {
-                        settings.singleImageGenerator = gen
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: settings.singleImageGenerator == gen
-                                  ? "largecircle.fill.circle" : "circle")
-                            Text(gen.displayName)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(disabled)
-                    .foregroundStyle(disabled ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
-                }
-
-                Text(settings.singleImageGenerator.detail)
-                    .font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if !triposplatAvailable {
-                    Label("TripoSplat needs the tripo-cli tool: install uv, then "
-                          + "`uv tool install tripo-cli` and `tripo-cli download`.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.caption).foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if settings.singleImageGenerator == .triposplat {
-                    sliderRow(title: "Gaussians",
-                              valueText: "\(Int(settings.triposplatGaussians))",
-                              value: $settings.triposplatGaussians, range: 32768...262144, step: 32768,
-                              caption: "How many Gaussians TripoSplat generates. More gives finer detail and a "
-                                + "larger file, at a little more time.")
-                }
+        radioCard("Splat method", items: SingleImageGenerator.allCases,
+                  selection: $settings.singleImageGenerator,
+                  label: { $0.displayName }, detail: { $0.detail },
+                  unavailable: Self.generatorUnavailableHint) {
+            if settings.singleImageGenerator == .triposplat {
+                sliderRow(title: "Gaussians",
+                          valueText: "\(Int(settings.triposplatGaussians))",
+                          value: $settings.triposplatGaussians, range: 32768...262144, step: 32768,
+                          caption: "How many Gaussians TripoSplat generates. More gives finer detail and a "
+                            + "larger file, at a little more time.")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(6)
-        } label: {
-            Text("Generator").font(.headline)
         }
     }
 
@@ -179,24 +147,72 @@ struct SettingsView: View {
     }
 
     private func methodCard(selection: Binding<MeshMethod>, cases: [MeshMethod]) -> some View {
+        radioCard("Mesh method", items: cases, selection: selection,
+                  label: { $0.displayName }, detail: { $0.detail },
+                  unavailable: Self.meshUnavailableHint) { EmptyView() }
+    }
+
+    /// A radio-button card whose individual items can be greyed out (disabled) with
+    /// a shared "how to enable" hint — the single, consistent way the app shows an
+    /// option that needs a tool that isn't installed (Photogrammetry, TripoSplat).
+    /// `extra` holds any controls specific to the selected item.
+    @ViewBuilder
+    private func radioCard<T: Hashable & Identifiable, Extra: View>(
+        _ title: String, items: [T], selection: Binding<T>,
+        label: @escaping (T) -> String, detail: @escaping (T) -> String,
+        unavailable: @escaping (T) -> String?,
+        @ViewBuilder extra: () -> Extra
+    ) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                Picker("Mesh method", selection: selection) {
-                    ForEach(cases) { method in Text(method.displayName).tag(method) }
+                ForEach(items) { item in
+                    let disabled = unavailable(item) != nil
+                    Button { selection.wrappedValue = item } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: selection.wrappedValue == item ? "largecircle.fill.circle" : "circle")
+                            Text(label(item))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled)
+                    .foregroundStyle(disabled ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
                 }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
 
-                Text(selection.wrappedValue.detail)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(detail(selection.wrappedValue))
+                    .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // Show the hint for whichever offered item is unavailable.
+                if let hint = items.compactMap(unavailable).first {
+                    Label(hint, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                extra()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(6)
         } label: {
-            Text("Mesh method").font(.headline)
+            Text(title).font(.headline)
         }
+    }
+
+    /// Install-hint for a mesh method that needs an absent tool, else nil.
+    private static func meshUnavailableHint(_ method: MeshMethod) -> String? {
+        if method == .photogrammetry && !ToolLocator.photogrammetryAvailable {
+            return "OpenMVS isn't installed. Run scripts/fetch-tools.sh to enable photogrammetry."
+        }
+        return nil
+    }
+
+    /// Install-hint for a splat generator that needs an absent tool, else nil.
+    private static func generatorUnavailableHint(_ gen: SingleImageGenerator) -> String? {
+        if gen == .triposplat && !ToolLocator.tripoSplatAvailable {
+            return "TripoSplat needs the tripo-cli tool: install uv, then "
+                + "`uv tool install tripo-cli` and `tripo-cli download`."
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -205,12 +221,6 @@ struct SettingsView: View {
         case .photogrammetry:
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {
-                    if !ToolLocator.photogrammetryAvailable {
-                        Label("OpenMVS isn't installed. Run scripts/fetch-tools.sh to enable photogrammetry.",
-                              systemImage: "exclamationmark.triangle")
-                            .font(.caption).foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                     sliderRow(title: "Detail",
                               valueText: String(format: "%.0f%%", settings.photogrammetryQuality * 100),
                               value: $settings.photogrammetryQuality, range: 0...1,
