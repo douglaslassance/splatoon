@@ -255,7 +255,7 @@ struct MeshViewer: NSViewRepresentable {
             scene.rootNode.addChildNode(camNode)
             cameraNode = camNode
 
-            moveSpeed = radius * 0.7
+            moveSpeed = radius * 0.35
             dollyScale = radius * 0.006
             panSensitivity = moveSpeed * 0.002
 

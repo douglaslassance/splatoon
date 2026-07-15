@@ -33,10 +33,15 @@ struct ContentView: View {
     private var content: some View {
         switch model.authorization {
         case .authorized, .limited:
-            if let opened = model.opened {
-                SplatDetailView(model: model, opened: opened)
-            } else {
+            // Keep the gallery alive underneath and overlay the detail view, so
+            // returning from a splat/mesh lands back at the same scroll position
+            // (swapping the views out would tear down the gallery's ScrollView).
+            ZStack {
                 GalleryView(model: model)
+                    .allowsHitTesting(model.opened == nil)
+                if let opened = model.opened {
+                    SplatDetailView(model: model, opened: opened)
+                }
             }
         case .notDetermined:
             AccessGate(

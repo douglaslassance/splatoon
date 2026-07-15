@@ -207,7 +207,7 @@ final class SplatViewerCoordinator: NSObject, MTKViewDelegate {
             mn = simd_min(mn, p.position); mx = simd_max(mx, p.position)
         }
         let radius = max(simd_length(mx - (mn + mx) / 2), 1e-3)
-        moveSpeed = radius * 0.7
+        moveSpeed = radius * 0.35
         dollyScale = radius * 0.006
         panSensitivity = moveSpeed * 0.002
     }
