@@ -166,14 +166,14 @@ echo "==> Installing TripoSplat CLI (optional, single-image 3D objects)"
 if ! command -v uv >/dev/null 2>&1; then
   echo "==> Installing uv"; brew list uv >/dev/null 2>&1 || brew install uv
 fi
-TRIPO_CLI_DIR="$(cd "$(dirname "$0")/../../tripo-cli" 2>/dev/null && pwd || true)"
+# tripo-cli lives in this repo (tripo-cli/), installed as an isolated uv tool.
+TRIPO_CLI_DIR="$(cd "$(dirname "$0")/../tripo-cli" 2>/dev/null && pwd || true)"
 if [ -n "$TRIPO_CLI_DIR" ] && [ -f "$TRIPO_CLI_DIR/pyproject.toml" ]; then
   uv tool install --force "$TRIPO_CLI_DIR"
   echo "==> Fetching TripoSplat weights (~3.8 GB)"
   tripo-cli download
 else
-  echo "==> Skipping TripoSplat: ../tripo-cli not found next to the Splatoon repo." >&2
-  echo "    Clone it, then run: uv tool install <path-to-tripo-cli> && tripo-cli download" >&2
+  echo "==> Skipping TripoSplat: tripo-cli/ not found in the repo." >&2
 fi
 
 echo ""

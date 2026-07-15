@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# uv
+# (uv.lock IS committed)
+
+# model weights (multi-GB; fetch with `tripo-cli download`)
+ckpts/
+*.safetensors
+
+# outputs
+*.ply
+*.splat
+*.webp

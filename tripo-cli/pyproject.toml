@@ -1,0 +1,25 @@
+[project]
+name = "tripo-cli"
+version = "0.1.0"
+description = "CLI wrapper around TripoSplat: single image -> 3D Gaussian splat (.ply), Apple-Silicon (MPS) friendly."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "torchvision",
+    "safetensors",
+    "pillow",
+    "numpy",
+    "tqdm",
+    "huggingface-hub",
+]
+
+[project.scripts]
+tripo-cli = "tripo_cli.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tripo_cli"]
