@@ -108,41 +108,53 @@ cp opensplat "$DEST/opensplat"
 # classic deps (Eigen/OpenCV/CGAL/Boost/VCGLib) — later versions pull in a heavy
 # vcpkg-only SfM stack we don't use (COLMAP already solves poses).
 #
-# Notes on the flags below, learned building against current Homebrew:
-#   - boost@1.85: Boost 1.90 made boost_system header-only, which OpenMVS's CMake
-#     rejects; the 1.85 keg still ships the component configs it wants.
-#   - CMAKE_CXX_STANDARD=17: v2.3.0 uses std::shared_ptr::unique(), removed in C++20.
-#   - explicit OpenMP flags: libomp isn't auto-detected with AppleClang.
-#   - viewer/python/breakpad off: GUI + bindings we don't need, and extra deps.
-# If your Homebrew Eigen is 5.x (very new), v2.3.0's `FIND_PACKAGE(Eigen3 3.4)`
-# will reject it — install an Eigen 3.4 or relax that line; standard `brew install
-# eigen` (3.4) works out of the box.
+# This recipe was hardened against a very new Homebrew/toolchain (Eigen 5,
+# AppleClang 21, Boost 1.90). Each workaround is load-bearing there and harmless
+# on older setups:
+#   - boost@1.85: Boost 1.90 made boost_system header-only, which v2.3.0 rejects.
+#   - vendored Eigen 3.4: Homebrew's eigen may be 5.x, which v2.3.0 refuses; Eigen
+#     is header-only, so clone 3.4 and point OpenMVS at it. Its bundled FindEigen3
+#     mis-parses non-3.x versions, so we force the Eigen block on (if(TRUE)).
+#   - patch std::shared_ptr::unique() (gone in newer libc++) -> use_count() != 1.
+#   - -Wno-* : AppleClang 21 promotes some VCGLib warnings to errors.
+#   - patch Utils.cmake so libomp is actually linked into the executables.
+#   - CMAKE_CXX_STANDARD=17, viewer/python/breakpad off, explicit OpenMP flags.
 echo "==> Building OpenMVS (photogrammetry mesh; optional)"
-for pkg in eigen cgal glew nanoflann libomp boost@1.85; do
+for pkg in cmake opencv cgal glew nanoflann libomp boost@1.85; do
   brew list "$pkg" >/dev/null 2>&1 || brew install "$pkg"
 done
 B185="$(brew --prefix boost@1.85)"
 LIBOMP="$(brew --prefix libomp)"
 OMVS_WORK="${TMPDIR:-/tmp}/splatoon-openmvs"
 rm -rf "$OMVS_WORK"; mkdir -p "$OMVS_WORK"; cd "$OMVS_WORK"
+git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git eigen34
 git clone --depth 1 https://github.com/cdcseacave/VCG.git vcglib
 git clone --depth 1 --branch v2.3.0 https://github.com/cdcseacave/openMVS.git openMVS
+# Source patches (see notes above).
+sed -i '' 's/if(EIGEN3_FOUND)/if(TRUE)/' openMVS/CMakeLists.txt
+sed -i '' 's/!store_\.unique()/store_.use_count() != 1/' openMVS/libs/Common/FastDelegateCPP11.h
+sed -i '' "s|set(CMAKE_EXE_LINKER_FLAGS \"-stdlib=libc++\")|set(CMAKE_EXE_LINKER_FLAGS \"-stdlib=libc++ -L$LIBOMP/lib -lomp -Wl,-rpath,$LIBOMP/lib\")|" openMVS/build/Utils.cmake
 mkdir -p openMVS_build && cd openMVS_build
 cmake ../openMVS -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+  -DCMAKE_CXX_FLAGS="-Wno-error -Wno-missing-template-arg-list-after-template-kw" \
   -DOpenMVS_USE_CUDA=OFF -DOpenMVS_USE_PYTHON=OFF \
   -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_BUILD_VIEWER=OFF \
   -DVCG_ROOT="$OMVS_WORK/vcglib" \
   -DBOOST_ROOT="$B185" -DBoost_DIR="$B185/lib/cmake/Boost-1.85.0" \
+  -DEIGEN3_INCLUDE_DIR="$OMVS_WORK/eigen34" -DEIGEN3_INCLUDE_DIRS="$OMVS_WORK/eigen34" \
   -DOpenMP_C_FLAGS="-Xclang -fopenmp -I$LIBOMP/include" \
   -DOpenMP_CXX_FLAGS="-Xclang -fopenmp -I$LIBOMP/include" \
   -DOpenMP_C_LIB_NAMES=omp -DOpenMP_CXX_LIB_NAMES=omp \
   -DOpenMP_omp_LIBRARY="$LIBOMP/lib/libomp.dylib" \
-  -DCMAKE_PREFIX_PATH="$(brew --prefix opencv);$(brew --prefix cgal);$(brew --prefix eigen);$(brew --prefix nanoflann);$B185"
+  -DCMAKE_PREFIX_PATH="$(brew --prefix opencv);$(brew --prefix cgal);$(brew --prefix nanoflann);$B185"
 cmake --build . --config Release -j"$(sysctl -n hw.ncpu)"
-# Install the tools Splatoon shells out to (DensifyPointCloud is the dense-MVS core).
+# Install into ~/.local/bin (the standard user-tools dir, on Splatoon's search
+# path) rather than Homebrew's managed bin — these aren't brew-managed, so they
+# don't belong there, and this keeps them trivially removable.
+USER_BIN="$HOME/.local/bin"; mkdir -p "$USER_BIN"
 for bin in InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureMesh; do
   found="$(find "$OMVS_WORK/openMVS_build" -maxdepth 3 -type f -name "$bin" | head -1)"
-  if [ -n "$found" ]; then echo "==> Installing $bin -> $DEST/$bin"; cp "$found" "$DEST/$bin"; fi
+  if [ -n "$found" ]; then echo "==> Installing $bin -> $USER_BIN/$bin"; cp "$found" "$USER_BIN/$bin"; fi
 done
 
 # --- TripoSplat CLI (optional, single-image 3D object generator) -------------
@@ -168,6 +180,6 @@ echo ""
 echo "Done."
 echo "  COLMAP:    $(command -v colmap)"
 echo "  OpenSplat: $DEST/opensplat"
-echo "  OpenMVS:   $DEST/DensifyPointCloud (+ ReconstructMesh, TextureMesh, …)"
+echo "  OpenMVS:   $HOME/.local/bin/DensifyPointCloud (+ ReconstructMesh, TextureMesh, …)"
 echo "  TripoSplat: $(command -v tripo-cli || echo 'not installed')"
 echo "Open a photo that has several same-place/time siblings to reconstruct a scene."

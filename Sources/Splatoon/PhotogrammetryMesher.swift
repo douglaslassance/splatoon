@@ -164,13 +164,13 @@ final class PhotogrammetryMesher {
             "--image-folder", dense.appendingPathComponent("images").path,
         ], onLine: percentSink(bands[1]))
 
-        // 3. Dense point cloud (CPU: --cuda-device -1). The slow stage.
+        // 3. Dense point cloud (CPU — this OpenMVS is built without CUDA, which
+        //    also means no `--cuda-device` option). The slow stage.
         report(bands[2], within: 0)
         try runTool(densifyPointCloud, stage: "densify", workDir: workDir, args: [
             "scene.mvs",
             "-o", "scene_dense.mvs",
             "--resolution-level", String(resolutionLevel),
-            "--cuda-device", "-1",
             "-w", workDir.path,
         ], onLine: percentSink(bands[2]))
 
