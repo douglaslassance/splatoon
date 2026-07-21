@@ -87,6 +87,18 @@ struct SettingsView: View {
                 .disabled(!settings.useMultiImageReconstruction)
                 .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Combine photos and videos", isOn: $settings.combinePhotosAndVideos)
+                    Text("Reconstruct from both photos and videos of the same place together. "
+                         + "Turn off to keep a scene to the item you open, a video builds from its own "
+                         + "frames only, a photo group from photos only, to compare, or to avoid mixing "
+                         + "shots from different cameras or lighting.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .disabled(!settings.useMultiImageReconstruction)
+                .opacity(settings.useMultiImageReconstruction ? 1 : 0.5)
+
                 sliderRow(title: "Training steps",
                           valueText: "\(Int(settings.multiImageIterations)) (~\(estimatedMinutes) min)",
                           value: $settings.multiImageIterations, range: 1000...30000, step: 500,

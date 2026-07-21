@@ -156,6 +156,14 @@ final class MeshSettings: ObservableObject {
     @Published var sceneMatchMode: SceneGrouping.MatchMode {
         didSet { defaults.set(sceneMatchMode.rawValue, forKey: Keys.sceneMatchMode) }
     }
+    /// Whether a scene may mix photos and videos. On (default) reconstructs from
+    /// every same-place source together. Off restricts a scene to the tapped item's
+    /// own media type — so a video builds from video frames only, a photo group from
+    /// photos only — to compare, or to avoid mixing shots taken with different
+    /// cameras or lighting.
+    @Published var combinePhotosAndVideos: Bool {
+        didSet { defaults.set(combinePhotosAndVideos, forKey: Keys.combinePhotosAndVideos) }
+    }
     /// Which generator turns a single photo into a splat: SHARP (fast relief) or
     /// TripoSplat (full 3D object via tripo-cli).
     @Published var singleImageGenerator: SingleImageGenerator {
@@ -272,6 +280,7 @@ final class MeshSettings: ObservableObject {
     private enum Keys {
         static let useMultiImageReconstruction = "reconstruction.useMultiImage"
         static let sceneMatchMode = "reconstruction.sceneMatchMode"
+        static let combinePhotosAndVideos = "reconstruction.combinePhotosAndVideos"
         static let singleImageGenerator = "generation.singleImageGenerator"
         static let triposplatGaussians = "generation.triposplatGaussians"
         static let multiImageIterations = "reconstruction.multiImageIterations"
@@ -295,6 +304,7 @@ final class MeshSettings: ObservableObject {
         useMultiImageReconstruction = defaults.object(forKey: Keys.useMultiImageReconstruction) as? Bool ?? true
         sceneMatchMode = SceneGrouping.MatchMode(rawValue: defaults.string(forKey: Keys.sceneMatchMode) ?? "")
             ?? .timeAndLocation
+        combinePhotosAndVideos = defaults.object(forKey: Keys.combinePhotosAndVideos) as? Bool ?? true
         singleImageGenerator = SingleImageGenerator(rawValue: defaults.string(forKey: Keys.singleImageGenerator) ?? "")
             ?? .sharp
         triposplatGaussians = defaults.object(forKey: Keys.triposplatGaussians) as? Double ?? 131072

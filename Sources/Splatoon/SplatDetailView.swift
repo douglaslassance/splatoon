@@ -90,7 +90,8 @@ struct SplatDetailView: View {
 
             Button {
                 model.regenerateOpened(options: settings.sceneOptions,
-                                       matchMode: settings.sceneMatchMode)
+                                       matchMode: settings.sceneMatchMode,
+                                       combineMedia: settings.combinePhotosAndVideos)
             } label: {
                 Label("Regenerate", systemImage: "arrow.clockwise")
             }

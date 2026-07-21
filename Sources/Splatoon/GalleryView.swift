@@ -18,6 +18,7 @@ struct GalleryView: View {
                             model.open(asset, allowMultiImage: settings.useMultiImageReconstruction,
                                       options: settings.sceneOptions,
                                       matchMode: settings.sceneMatchMode,
+                                      combineMedia: settings.combinePhotosAndVideos,
                                       singleImageGenerator: settings.singleImageGenerator,
                                       triposplatGaussians: Int(settings.triposplatGaussians))
                         }

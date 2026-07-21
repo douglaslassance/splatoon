@@ -212,13 +212,20 @@ final class GalleryModel: ObservableObject {
               options: SceneOptions = SceneOptions(iterations: 15000, shDegree: 1,
                                                    globalPoseSolver: false, trainer: .openSplat),
               matchMode: SceneGrouping.MatchMode = .timeAndLocation,
+              combineMedia: Bool = true,
               singleImageGenerator: SingleImageGenerator = .sharp,
               triposplatGaussians: Int = 131072) {
         errorMessage = nil
         resetOpenedMesh()
 
         if allowMultiImage {
-            let group = SceneGrouping.neighbors(of: asset, in: assets, matchMode: matchMode)
+            var group = SceneGrouping.neighbors(of: asset, in: assets, matchMode: matchMode)
+            // When mixing is off, keep only sources of the tapped item's own media
+            // type, so a video reconstructs from video frames only (and a photo group
+            // from photos only) — for comparing, or avoiding mismatched cameras.
+            if !combineMedia {
+                group = group.filter { $0.mediaType == asset.mediaType }
+            }
             if SceneGrouping.isScene(group) {
                 openScene(group, hero: asset, options: options)
                 return
@@ -452,7 +459,8 @@ final class GalleryModel: ObservableObject {
 
     /// Discard the opened splat's cached files and rebuild it from the original
     /// source (photo, photo group, or video). Uses the current settings.
-    func regenerateOpened(options: SceneOptions, matchMode: SceneGrouping.MatchMode = .timeAndLocation) {
+    func regenerateOpened(options: SceneOptions, matchMode: SceneGrouping.MatchMode = .timeAndLocation,
+                          combineMedia: Bool = true) {
         guard let opened, let asset = sourceForOpened[opened.id] else { return }
         let wasScene = opened.isScene
 
@@ -467,7 +475,8 @@ final class GalleryModel: ObservableObject {
         if asset.mediaType == .video && !wasScene {
             openVideoSingleFrame(asset)                                   // the video's SHARP fallback
         } else {
-            open(asset, allowMultiImage: wasScene, options: options, matchMode: matchMode)
+            open(asset, allowMultiImage: wasScene, options: options, matchMode: matchMode,
+                 combineMedia: combineMedia)
         }
     }
 
