@@ -273,6 +273,19 @@ final class MultiImageReconstructor {
             try? fm.createSymbolicLink(at: projectImages, withDestinationURL: imagesDir)
         }
 
+        // `global_mapper` has no focal-length clamp — the incremental `mapper` bounds
+        // focals to a sane ratio as it refines them, global_mapper doesn't — and it
+        // solves a camera per frame whose bundle-adjusted focal can go degenerate
+        // (negative, or millions of px) at scene scale. The trainer then can't
+        // reconcile the inconsistent per-view projections: the splat diverges and its
+        // pruner collapses it to a near-empty cloud that renders as a black viewport.
+        // When any camera's focal is degenerate, collapse the model to one shared
+        // camera per image-resolution group (a lone video → one camera; a mixed
+        // photo+video scene → one per resolution), each at a robust median focal — so
+        // the sane geometry survives without dropping or distorting any view. A model
+        // with no degenerate camera is left untouched; any failure leaves it as-is.
+        sanitizeDegenerateCameras(modelDir: zero, workDir: workDir)
+
         // 4. Train the Gaussian splat. Both trainers read this COLMAP project and
         // write a standard 3DGS PLY to `output`; each also leaves a scene-scoped
         // cameras.json next to it (OpenSplat writes one; for Brush we synthesize
@@ -592,6 +605,131 @@ final class MultiImageReconstructor {
         guard let cameras = Self.parseColmapModel(txtDir: txtDir), !cameras.isEmpty,
               let data = try? JSONEncoder().encode(cameras) else { return }
         try? data.write(to: camerasURL)
+    }
+
+    /// Test hook: run camera sanitization on `modelDir` in place (see
+    /// `--selftest-sanitize`). Builds a throwaway reconstructor just to reach the
+    /// instance method; `trainer` is unused by that path.
+    static func selftestSanitizeCameras(colmap: URL, modelDir: URL, workDir: URL) {
+        MultiImageReconstructor(colmap: colmap, trainer: colmap)
+            .sanitizeDegenerateCameras(modelDir: modelDir, workDir: workDir)
+    }
+
+    /// One camera row parsed from COLMAP's text model.
+    private struct ColmapCamera { let id: String; let width: Int; let height: Int; let focal: Double }
+
+    /// A focal is sane when it's positive and within a few × the image's long side.
+    /// `global_mapper`'s unclamped bundle adjustment leaves some far outside this.
+    private static func focalIsSane(_ focal: Double, width: Int, height: Int) -> Bool {
+        let maxDim = Double(max(width, height))
+        return focal.isFinite && focal >= 0.3 * maxDim && focal <= 4.0 * maxDim
+    }
+
+    /// Repair a COLMAP sparse model in place when `global_mapper` left degenerate
+    /// camera focals (see the call site). Collapses every camera to one shared camera
+    /// per image-resolution group — a lone video yields a single camera, a mixed
+    /// photo+video scene one per resolution — each a `SIMPLE_PINHOLE` at the group's
+    /// median in-band focal (COLMAP's 1.2·maxDim prior when a group is all junk).
+    /// Poses and 3D points are untouched, so no view is dropped or distorted; only
+    /// the intrinsics are made consistent, which is what the trainer needs to
+    /// converge. A model whose cameras are all already sane is left alone. The
+    /// `rigs.txt`/`frames.txt` the export emits name the old per-frame cameras, so
+    /// they're dropped before reconversion and COLMAP rebuilds a clean rig.
+    /// Best-effort: any parse/convert failure leaves the model as COLMAP produced it.
+    private func sanitizeDegenerateCameras(modelDir: URL, workDir: URL) {
+        let fm = FileManager.default
+        let txtDir = workDir.appendingPathComponent("sparse_sanitize_txt", isDirectory: true)
+        try? fm.removeItem(at: txtDir)
+        guard (try? fm.createDirectory(at: txtDir, withIntermediateDirectories: true)) != nil else { return }
+        do {
+            try runTool(colmap, stage: "camera sanitize export", workDir: workDir, args: [
+                "model_converter", "--input_path", modelDir.path,
+                "--output_path", txtDir.path, "--output_type", "TXT",
+            ])
+        } catch { return }
+
+        let camerasTxt = txtDir.appendingPathComponent("cameras.txt")
+        let imagesTxt = txtDir.appendingPathComponent("images.txt")
+        guard let camerasText = try? String(contentsOf: camerasTxt, encoding: .utf8),
+              let imagesText = try? String(contentsOf: imagesTxt, encoding: .utf8) else { return }
+
+        // Each camera row is `CAMERA_ID MODEL WIDTH HEIGHT PARAMS…`; PARAMS[0] is
+        // always a focal. Preserve first-seen order for deterministic new ids.
+        var cameras: [ColmapCamera] = []
+        for line in camerasText.split(separator: "\n") where !line.hasPrefix("#") {
+            let f = line.split(separator: " ").map(String.init)
+            guard f.count >= 5, let w = Int(f[2]), let h = Int(f[3]), let focal = Double(f[4]), w > 0, h > 0
+            else { continue }
+            cameras.append(ColmapCamera(id: f[0], width: w, height: h, focal: focal))
+        }
+        // Nothing to do unless at least one camera is degenerate — a healthy model
+        // (e.g. the incremental mapper's clamped output) keeps its refined intrinsics.
+        guard !cameras.isEmpty,
+              cameras.contains(where: { !Self.focalIsSane($0.focal, width: $0.width, height: $0.height) })
+        else { return }
+
+        // Group cameras by image resolution; each group becomes one shared camera at
+        // the group's median in-band focal. New ids are 1-based in first-seen order.
+        var order: [(w: Int, h: Int)] = []
+        var focalsByRes: [String: [Double]] = [:]
+        var newIDByRes: [String: Int] = [:]
+        for cam in cameras {
+            let key = "\(cam.width)x\(cam.height)"
+            if newIDByRes[key] == nil {
+                newIDByRes[key] = order.count + 1
+                order.append((cam.width, cam.height))
+            }
+            if Self.focalIsSane(cam.focal, width: cam.width, height: cam.height) {
+                focalsByRes[key, default: []].append(cam.focal)
+            }
+        }
+        var newCameraRows = ["# Camera list"]
+        var oldToNew: [String: Int] = [:]
+        for (index, res) in order.enumerated() {
+            let key = "\(res.w)x\(res.h)"
+            let newID = index + 1
+            let maxDim = Double(max(res.w, res.h))
+            let inliers = (focalsByRes[key] ?? []).sorted()
+            let focal = inliers.isEmpty ? 1.2 * maxDim : inliers[inliers.count / 2]
+            newCameraRows.append("\(newID) SIMPLE_PINHOLE \(res.w) \(res.h) \(focal) "
+                + "\(Double(res.w) / 2) \(Double(res.h) / 2)")
+            for cam in cameras where cam.width == res.w && cam.height == res.h { oldToNew[cam.id] = newID }
+        }
+
+        // Repoint every image's CAMERA_ID (field 9, 1-based) at its resolution group.
+        var newImages: [String] = []
+        for line in imagesText.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("#") { newImages.append(String(line)); continue }
+            var f = line.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+            // Two lines per image: a pose line then its points2D line. A pose line is
+            // `IMAGE_ID … CAMERA_ID NAME` — numeric IMAGE_ID, ending in the image
+            // filename (non-numeric); a points2D line ends in a numeric point id. Key
+            // off both so only pose lines are touched; points lines (and blanks) copy
+            // through untouched.
+            if f.count >= 10, Int(f[0]) != nil, let last = f.last, Double(last) == nil,
+               let mapped = oldToNew[f[8]] {
+                f[8] = String(mapped)
+                newImages.append(f.joined(separator: " "))
+            } else {
+                newImages.append(String(line))
+            }
+        }
+        guard (try? (newCameraRows.joined(separator: "\n") + "\n")
+                .write(to: camerasTxt, atomically: true, encoding: .utf8)) != nil,
+              (try? (newImages.joined(separator: "\n") + "\n")
+                .write(to: imagesTxt, atomically: true, encoding: .utf8)) != nil else { return }
+
+        // Drop the rig/frame text (it still names the old per-frame cameras) so the
+        // reconversion rebuilds a clean rig for the consolidated cameras.
+        try? fm.removeItem(at: txtDir.appendingPathComponent("rigs.txt"))
+        try? fm.removeItem(at: txtDir.appendingPathComponent("frames.txt"))
+
+        // Reconvert the rewritten text model back to binary, in place, replacing the
+        // model COLMAP wrote with the sanitized one the trainers then read.
+        try? runTool(colmap, stage: "camera sanitize import", workDir: workDir, args: [
+            "model_converter", "--input_path", txtDir.path,
+            "--output_path", modelDir.path, "--output_type", "BIN",
+        ])
     }
 
     /// Parse COLMAP's text `cameras.txt` + `images.txt` into cameras.json rows,

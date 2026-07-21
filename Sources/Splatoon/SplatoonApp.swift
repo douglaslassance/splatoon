@@ -37,6 +37,9 @@ struct SplatoonApp: App {
         if CommandLine.arguments.contains("--selftest-render-camera") {
             runRenderCameraSelfTest()
         }
+        if CommandLine.arguments.contains("--selftest-sanitize") {
+            runSanitizeSelfTest()
+        }
     }
 
     var body: some Scene {
@@ -372,6 +375,26 @@ private func writePNG(from texture: MTLTexture, to url: URL) throws {
     guard CGImageDestinationFinalize(destination) else {
         throw NSError(domain: "SelfTest", code: 9, userInfo: [NSLocalizedDescriptionKey: "Could not finalize PNG"])
     }
+}
+
+/// Sanitizes a COLMAP sparse model's degenerate cameras in place, for verification.
+/// Usage: `Splatoon --selftest-sanitize <sparse_model_dir>`.
+private func runSanitizeSelfTest() -> Never {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: "--selftest-sanitize"), args.count > idx + 1 else {
+        print("SELFTEST sanitize: usage --selftest-sanitize <sparse_model_dir>"); exit(1)
+    }
+    let modelDir = URL(fileURLWithPath: args[idx + 1])
+    guard let colmap = ToolLocator.resolvedURL(for: .colmap) else {
+        print("SELFTEST sanitize: colmap not found"); exit(1)
+    }
+    let workDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("splatoon-selftest-sanitize", isDirectory: true)
+    try? FileManager.default.removeItem(at: workDir)
+    try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+    MultiImageReconstructor.selftestSanitizeCameras(colmap: colmap, modelDir: modelDir, workDir: workDir)
+    print("SELFTEST sanitize OK -> \(modelDir.path)")
+    exit(0)
 }
 
 /// Gravity-aligns a scene PLY + cameras.json in place, for verification.
