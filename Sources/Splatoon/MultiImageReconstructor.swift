@@ -1138,7 +1138,10 @@ final class MultiImageReconstructor {
         for name in names {
             if let caps = captures(#"^vid(\d+)-\d+\.jpg$"#, in: name), let src = Int(caps[0]) {
                 sequences[src, default: []].append(name)
-            } else if captures(#"^photo\d+\.jpg$"#, in: name) != nil {
+            } else if captures(#"^photo(\d+)\.jpg$"#, in: name) != nil {
+                // The capture group is required: `captures` returns nil for a match
+                // with no groups, which would misfile every photo as "other" and
+                // force the whole scene onto the O(n²) exhaustive matcher.
                 photos.append(name)
             } else {
                 other = true
